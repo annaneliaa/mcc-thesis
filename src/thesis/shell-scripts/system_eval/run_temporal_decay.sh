@@ -30,8 +30,21 @@ SCENARIOS=(cscas)
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 MINING_SETTINGS="$REPO_ROOT/src/thesis/configs/screening_mining_settings.yaml"
 GRANULARITIES=(0.1 0.25 0.5)  # keep to the mining grid's MINE_FRACS so every gran has structural backing
+# Every model is crossed with every (grid setting x granularity). logreg and
+# xgboost are supervised (fit on the mixed W_src train split); iforest and
+# ocsvm are one-class -- fit unsupervised on the benign rows, then Platt-scaled
+# against the labels so they score like a classifier (see
+# experiments._shared.fit_scored_model). THRESHOLD_MODE="fixed" resolves per
+# model to its own operating point (0.5 for the classifiers, the
+# contamination cut for the one-class models), so precision/recall/FPR are
+# meaningful for all of them without a calibration target.
+MODELS=(logreg xgboost iforest ocsvm)
 THRESHOLD_MODE="fixed"  # or "calibrated_recall"
 CALIBRATED_RECALL_TARGET="0.90"  # only used when THRESHOLD_MODE=calibrated_recall
+# SHAP/LIME per horizon is cheap for logreg (LinearExplainer) and xgboost
+# (TreeExplainer) but slow for iforest/ocsvm (no analytic explainer -- SHAP
+# falls back to PermutationExplainer over ~325 features). Drop EXPLAIN_SAMPLE_N
+# or set COMPUTE_EXPLANATIONS=0 for a faster first pass.
 COMPUTE_EXPLANATIONS=1  # 0 to skip SHAP/LIME (metrics only, much faster)
 EXPLAIN_SAMPLE_N=50
 LIME_NUM_SAMPLES=1000
@@ -68,6 +81,7 @@ for scenario in "${SCENARIOS[@]}"; do
     "$scenario" \
     --mining-settings "$MINING_SETTINGS" \
     --granularities "${GRANULARITIES[@]}" \
+    --models "${MODELS[@]}" \
     --threshold-mode "$THRESHOLD_MODE" \
     --explain-sample-n "$EXPLAIN_SAMPLE_N" \
     --lime-num-samples "$LIME_NUM_SAMPLES")

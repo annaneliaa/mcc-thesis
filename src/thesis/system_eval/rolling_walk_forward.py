@@ -164,7 +164,9 @@ def fit_window(
     model.fit(X, y)
     proba = model.predict_proba(X)[:, 1]
 
-    threshold = decide_threshold(y, proba, threshold_mode, calibrated_recall_target)
+    threshold = decide_threshold(
+        y, proba, threshold_mode, calibrated_recall_target, model=model
+    )
 
     return WindowFit(
         schema=schema,

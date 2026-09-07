@@ -183,7 +183,6 @@ class TemporalDecayConfig:
     # own default is 5000; kept lower here since it's paid n_windows x
     # explain_sample_n times per config)
     lime_num_samples: int = 1000
-    top_n_importances: int = 30
     cache_dir: Path = field(default_factory=lambda: CACHE_DIR)
     grouping: GroupingConfig = field(default_factory=GroupingConfig)
     alerts_json_path: Path | None = None

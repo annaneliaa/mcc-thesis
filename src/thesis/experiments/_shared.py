@@ -32,6 +32,8 @@ from thesis.pipeline.pipeline import (
 )
 from thesis.schemas.features import BaseFeatureSchema, FeatureSchema
 from thesis.schemas.groups import AlertGroup
+from thesis.training.model_factory import get_model_factory
+from thesis.training.pool_sampling import class_weighted_extra_kwargs
 from thesis.training.workload import compute_workload_at_recall
 
 _ROOT = Path(__file__).resolve().parents[3]
@@ -52,23 +54,36 @@ def labels_and_mask(window_rows: list[AlertGroup]) -> tuple[np.ndarray, np.ndarr
 
 
 def decide_threshold(
-    y_src: np.ndarray, proba_src: np.ndarray, mode: str, recall_target: float
+    y_src: np.ndarray,
+    proba_src: np.ndarray,
+    mode: str,
+    recall_target: float,
+    model=None,
 ) -> float:
-    """mode="fixed" -> 0.5. mode="calibrated_recall" -> the threshold that
-    achieves at least `recall_target` recall on the given scores
-    (compute_workload_at_recall), falling back to 0.5 (with a warning, never
-    raising) if that target isn't reachable (e.g. single-class input)."""
+    """mode="fixed" -> the model's own no-tuning operating point: 0.5 for a
+    supervised classifier (probability midpoint), or a one-class detector's
+    own contamination cut (`_PlattScaledOneClass.default_threshold` -- the
+    Platt probability at which its `predict()` flips). A flat 0.5 in
+    Platt-probability space is not a meaningful cut for a one-class model on
+    an imbalanced scenario -- it usually sits above every calibrated
+    probability, so everything is predicted benign.
+
+    mode="calibrated_recall" -> the threshold that achieves at least
+    `recall_target` recall on the given scores (compute_workload_at_recall),
+    falling back to that fixed operating point (with a warning, never
+    raising) if the target isn't reachable (e.g. single-class input)."""
+    fixed = float(getattr(model, "default_threshold", 0.5))
     if mode == "fixed":
-        return 0.5
+        return fixed
     if mode == "calibrated_recall":
         result = compute_workload_at_recall(y_src, proba_src, targets=(recall_target,))
         entry = result.get(f"{recall_target:.2f}")
         if entry is None:
             print(
                 f"    [warn] calibrated_recall target {recall_target:.2f} "
-                "unreachable -- falling back to 0.5"
+                f"unreachable -- falling back to {fixed:.3f}"
             )
-            return 0.5
+            return fixed
         return float(entry["threshold"])
     raise ValueError(f"unknown threshold_mode {mode!r}")
 
@@ -120,6 +135,101 @@ def nan_metrics() -> dict:
 
 def sample_rows(X: pd.DataFrame, n: int, random_state: int) -> pd.DataFrame:
     return X.sample(min(n, len(X)), random_state=random_state) if len(X) else X
+
+
+# One-class anomaly detectors (thesis.training.model_factory). They fit
+# unsupervised (`fit(X)`, no labels) on benign traffic and expose
+# `decision_function` / `predict` (-1/+1), not `predict_proba`.
+ONE_CLASS_MODELS = frozenset({"iforest", "ocsvm", "bernoulli_oc", "autoencoder_oc"})
+
+
+class _PlattScaledOneClass:
+    """Adapts a fitted one-class anomaly detector to the binary-classifier
+    interface the experiments expect (`predict_proba(X)[:, 1]` = attack
+    likelihood).
+
+    The detector is trained unsupervised on benign rows only. This wrapper
+    adds a 1-D logistic (Platt) calibration of its signed anomaly score
+    (`-decision_function`, higher = more anomalous) against the labels that
+    *are* available on W_src's train split -- fit once and frozen. So a
+    Platt-scaled one-class model drops into the exact same threshold /
+    metric / SHAP (via `predict_proba`) / LIME (classification mode) path as
+    logreg or xgboost, with no parallel anomaly-scoring branch.
+
+    `default_threshold` is the Platt probability at which the underlying
+    detector's own `predict()` flips (its `contamination` cut) -- the
+    label-free operating point `decide_threshold(mode="fixed")` uses for a
+    one-class model, since a flat 0.5 in this probability space usually
+    predicts everything benign on an imbalanced scenario.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+        self._platt = None
+        self.default_threshold = 0.5
+
+    def _raw(self, X) -> np.ndarray:
+        return -np.asarray(self.inner.decision_function(X), dtype=float)
+
+    def calibrate(self, X, y) -> "_PlattScaledOneClass":
+        from sklearn.linear_model import LogisticRegression
+
+        raw = self._raw(X)
+        self._platt = LogisticRegression().fit(raw.reshape(-1, 1), np.asarray(y))
+
+        # Where does inner.predict() flip on this same data? Midpoint between
+        # the highest raw score it still calls normal and the lowest it calls
+        # anomalous -- works whatever the detector's internal convention
+        # (threshold_ attribute, decision_function sign, ...). Map that raw
+        # boundary through the (monotonic) Platt scaler to a probability, so
+        # `proba >= default_threshold` reproduces inner.predict() == -1.
+        flagged = np.asarray(self.inner.predict(X)) == -1
+        if flagged.any() and (~flagged).any():
+            boundary = 0.5 * (raw[flagged].min() + raw[~flagged].max())
+        else:  # degenerate (all/none flagged) -- fall back to the score's own tail
+            boundary = float(np.quantile(raw, 0.95))
+        self.default_threshold = float(self._platt.predict_proba([[boundary]])[0, 1])
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        return self._platt.predict_proba(self._raw(X).reshape(-1, 1))
+
+
+def fit_scored_model(model_name: str, X_train: pd.DataFrame, y_train: np.ndarray):
+    """Fit `model_name` on W_src's train split; return an object exposing
+    `predict_proba(X)[:, 1]` as attack likelihood.
+
+    Supervised models fit on the whole split, class-imbalance-aware: every
+    one is handed `class_weighted_extra_kwargs` (class_weight="balanced" for
+    sklearn, scale_pos_weight for xgboost/torch_nn), so a fixed 0.5
+    threshold is a meaningful operating point for all of them -- not just
+    logreg/rf, which hardcode "balanced" and ignore the kwargs. Without
+    this, an unweighted xgboost on this scenario's ~1.5% attack rate sits
+    at a low-recall corner at 0.5, not comparable to logreg's.
+
+    One-class models (`ONE_CLASS_MODELS`) fit unsupervised on the benign
+    rows only, then get a frozen Platt scaler over the labeled split (see
+    `_PlattScaledOneClass`).
+
+    Returns None (never raises) when the split can't support a fit -- a
+    supervised model needs both classes present, a one-class model needs
+    enough benign rows to fit and at least one attack row to calibrate.
+    """
+    y_train = np.asarray(y_train)
+
+    if model_name not in ONE_CLASS_MODELS:
+        if len(np.unique(y_train)) < 2:
+            return None
+        est = get_model_factory(model_name, **class_weighted_extra_kwargs(y_train))()
+        est.fit(X_train, y_train)
+        return est
+
+    est = get_model_factory(model_name)()
+    benign = y_train == 0
+    if benign.sum() < 10 or (y_train == 1).sum() < 1:
+        return None
+    est.fit(X_train[benign])
+    return _PlattScaledOneClass(est).calibrate(X_train, y_train)
 
 
 @dataclass(slots=True)

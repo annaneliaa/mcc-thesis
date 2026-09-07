@@ -7,6 +7,11 @@ import pandas as pd
 import pytest
 
 from thesis.system_eval.temporal_decay import _build_decay_summary
+from thesis.experiments._shared import (
+    decide_threshold,
+    fit_scored_model,
+    metrics_at_threshold,
+)
 from thesis.metrics.shortlist import load_shortlist
 
 
@@ -166,3 +171,75 @@ def test_load_shortlist_unknown_model_raises(tmp_path):
     )
     with pytest.raises(ValueError, match="not_a_real_model"):
         load_shortlist(path)
+
+
+# ---- fit_scored_model -------------------------------------------------------
+
+
+def _separable_split(seed: int = 0):
+    rng = np.random.default_rng(seed)
+    X = pd.DataFrame(rng.normal(size=(300, 6)), columns=[f"f{i}" for i in range(6)])
+    y = np.r_[np.zeros(270), np.ones(30)].astype(int)
+    X.loc[y == 1] += 2.5  # attacks shifted away from the benign cloud
+    return X, y
+
+
+@pytest.mark.parametrize("model_name", ["logreg", "iforest", "ocsvm"])
+def test_fit_scored_model_exposes_attack_probability(model_name):
+    X, y = _separable_split()
+    model = fit_scored_model(model_name, X, y)
+    proba = model.predict_proba(X)[:, 1]
+    assert proba.shape == (len(X),)
+    assert ((proba >= 0) & (proba <= 1)).all()
+    # attacks are cleanly separable here -> mean attack proba > mean benign proba
+    assert proba[y == 1].mean() > proba[y == 0].mean()
+
+
+def test_fit_scored_model_returns_none_when_split_cannot_fit():
+    X, y = _separable_split()
+    benign_only = np.zeros(len(X), dtype=int)
+    assert (
+        fit_scored_model("logreg", X, benign_only) is None
+    )  # supervised needs both classes
+    assert (
+        fit_scored_model("iforest", X, benign_only) is None
+    )  # one-class needs an attack to calibrate
+
+
+def _imbalanced_split(seed: int = 2):
+    rng = np.random.default_rng(seed)
+    X = pd.DataFrame(
+        np.vstack([rng.normal(size=(1500, 6)), rng.normal(size=(40, 6)) + 1.4]),
+        columns=[f"f{i}" for i in range(6)],
+    )
+    y = np.r_[np.zeros(1500), np.ones(40)].astype(int)
+    return X, y
+
+
+@pytest.mark.parametrize("model_name", ["iforest", "ocsvm"])
+def test_fixed_threshold_for_one_class_is_the_contamination_cut_not_half(model_name):
+    # A flat 0.5 in Platt-probability space predicts everything benign for a
+    # one-class model on this imbalance -- "fixed" must instead resolve to the
+    # detector's own contamination operating point.
+    X, y = _imbalanced_split()
+    model = fit_scored_model(model_name, X, y)
+    proba = model.predict_proba(X)[:, 1]
+
+    assert model.default_threshold < 0.5
+    thr = decide_threshold(y, proba, "fixed", 0.9, model=model)
+    assert thr == pytest.approx(model.default_threshold)
+
+    met = metrics_at_threshold(y, proba, thr)
+    assert met["tp"] > 0 and met["recall"] > 0  # not the all-benign degenerate case
+    # the cut reproduces the detector's own predict()
+    hard = (proba >= thr).astype(int)
+    assert (hard == (model.inner.predict(X) == -1).astype(int)).mean() > 0.99
+
+
+def test_fixed_threshold_for_supervised_model_stays_at_half():
+    X, y = _separable_split()
+    model = fit_scored_model("logreg", X, y)
+    assert (
+        decide_threshold(y, model.predict_proba(X)[:, 1], "fixed", 0.9, model=model)
+        == 0.5
+    )

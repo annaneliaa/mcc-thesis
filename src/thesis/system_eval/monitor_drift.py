@@ -282,7 +282,7 @@ def fit_source_window_and_dynamic_schema(
     model.fit(X_train, y_train)
     proba_train = model.predict_proba(X_train)[:, 1]
     threshold = decide_threshold(
-        y_train, proba_train, threshold_mode, calibrated_recall_target
+        y_train, proba_train, threshold_mode, calibrated_recall_target, model=model
     )
 
     return MonitorSourceWindowFit(

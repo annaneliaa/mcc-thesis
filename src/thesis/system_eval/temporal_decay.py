@@ -1,12 +1,26 @@
 """
 Experiment 2: Temporal Generalization (Rolling-Horizon Decay).
 
-Purpose: for a shortlisted (feature_set, mining_setting, granularity, model)
-config -- the output of Experiment 1 (screening_sweep.py +
-thesis.metrics.config_selection) -- test whether a schema+model trained on
-the *first* chronological window still discriminates well on future windows,
-how AUC/F1/etc and FPR decay as temporal distance increases, and how SHAP/
-LIME feature attributions drift alongside that decay.
+Purpose: for a (feature_set, mining_setting, granularity, model) config from
+the parameter grid (configs/screening_mining_settings.yaml x granularities x
+models -- no separate screening/shortlist step), test whether a schema+model
+trained on the *first* chronological window still discriminates well on
+future windows, how AUC/F1/etc and FPR decay as temporal distance increases,
+and how per-feature importances drift alongside that decay.
+
+Models: supervised classifiers (logreg, xgboost, ...) fit on the mixed W_src
+train split, every one made class-imbalance-aware (class_weight="balanced"
+/ scale_pos_weight); one-class anomaly detectors (iforest, ocsvm) fit
+unsupervised on its benign rows and are then Platt-scaled against the
+labels so they score like a classifier -- see
+experiments._shared.fit_scored_model. Both kinds go through the identical
+freeze/threshold/metric/SHAP/LIME path below.
+
+threshold_mode="fixed" resolves per model to its own no-tuning operating
+point: 0.5 for a (balanced) classifier, the detector's own contamination
+cut for a one-class model (a flat 0.5 in Platt-probability space would
+predict everything benign on this imbalance). "calibrated_recall" tunes the
+threshold to a target recall on W_src instead.
 
 W_src is always window 0 -- there is no other source-window role. For a
 given granularity g, the timeline is carved into n(g) windows exactly as in
@@ -18,9 +32,13 @@ own internal train/test split (pipeline.compute_window_train_end, same
      (mining.window_schema_cache.get_or_mine_window_attribute_schema --
      the same train-split-only mining screening_sweep uses, unlike the
      previous version of this experiment which mined on the full window).
-  2. Fit the config's model on window 0's train split.
-  3. Fix a decision threshold from that train split's own scores (flat 0.5,
-     or a calibrated-recall threshold) -- computed once.
+  2. Fit the config's model on window 0's train split (fit_scored_model --
+     supervised on the whole split, one-class on its benign rows + a frozen
+     Platt scaler).
+  3. Fix a decision threshold once -- the model's own operating point
+     ("fixed": 0.5 for a classifier, the contamination cut for a one-class
+     detector) or a calibrated-recall threshold from the train split's
+     scores.
   4. Freeze schema, model, and threshold. Walk the horizon forward one
      window at a time, from h=0 (window 0's held-out *test* split) through
      h=n_windows-1 (the last window), scoring each window's alert_groups
@@ -28,21 +46,24 @@ own internal train/test split (pipeline.compute_window_train_end, same
      construction (W_src is always the earliest window), so there is no
      boundary-skip bookkeeping to do here, unlike the multi-role design this
      replaced.
-  5. At every horizon step, also compute SHAP and LIME signed feature
-     importances (thesis.training.explain) on a sample of that window's rows
-     -- same frozen model, same frozen SHAP/LIME background sample drawn
-     once from window 0's train split -- so any change in the reported
+  5. At every horizon step, also compute SHAP and LIME signed importances
+     (thesis.training.explain) for *every* schema feature on a sample of
+     that window's rows -- same frozen model, same frozen background sample
+     drawn once from window 0's train split -- so any change in the reported
      importances reflects the target window drifting, not the explainer's
-     reference point moving.
+     reference point moving. These are model-*output* attributions (which
+     features move the score, and which way), not model-*performance*
+     attributions.
 
 Outputs: per_horizon_results.csv (one row per config x horizon window,
 including the h=0 held-out anchor), decay_summary.csv (score/FPR at h=0 vs
 the last horizon actually run, and their difference), explanations.csv
-(long format: one row per config x horizon x method[shap|lime] x feature),
-lime_fidelity.csv (one row per config x horizon: LIME's own local-surrogate
-R^2, averaged over that horizon's explained sample -- separate from
-explanations.csv since it's one number per horizon, not per feature),
-summary.txt, config.json.
+(long format: one row per config x horizon x method[shap|lime] x feature --
+every schema feature, so the EDA notebook's per-horizon importance heatmap
+has no holes), lime_fidelity.csv (one row per config x horizon: LIME's own
+local-surrogate R^2, averaged over that horizon's explained sample --
+separate from explanations.csv since it's one number per horizon, not per
+feature), summary.txt, config.json.
 
 fit_source_window and encode_target_window (below) are also the entry
 points thesis.experiments.instance_explain uses for on-demand, single-
@@ -66,6 +87,7 @@ from thesis.experiments._shared import (
     CONFIG_COLS,
     METRIC_COLS,
     decide_threshold,
+    fit_scored_model,
     labels_and_mask,
     load_scenario_context,
     metrics_at_threshold,
@@ -83,7 +105,6 @@ from thesis.training.explain import (
     compute_lime_signed_importances,
     compute_shap_signed_importances,
 )
-from thesis.training.model_factory import get_model_factory
 
 _ROOT = Path(__file__).resolve().parents[3]
 _EXPERIMENTS_DIR = _ROOT / "artifacts" / "experiments" / "temporal_decay"
@@ -199,17 +220,24 @@ def fit_source_window(
         print("    [warn] window 0 train split is single-class -- skipping")
         return None
 
-    # "logreg"/"logreg_l1" (model_factory.py) are themselves scaled Pipelines,
-    # so the fitted scaler is frozen along with the model (fit on W_src's
-    # train split only, reused for every horizon's target window) like
-    # everything else in this experiment's "freeze schema, model, threshold"
-    # design.
-    model = get_model_factory(cfg.model)()
-    model.fit(X_train, y_train)
+    # fit_scored_model returns something exposing predict_proba(X)[:, 1] as
+    # attack likelihood, frozen along with everything else in this
+    # experiment's "freeze schema, model, threshold" design:
+    #  - supervised models ("logreg" etc. -- themselves scaled Pipelines, so
+    #    the fitted scaler is frozen too) fit on the whole train split;
+    #  - one-class anomaly models ("iforest", "ocsvm") fit unsupervised on
+    #    the benign rows, then get a frozen 1-D Platt scaler over the labeled
+    #    split so their anomaly score reads as a probability downstream.
+    model = fit_scored_model(cfg.model, X_train, y_train)
+    if model is None:
+        print(
+            "    [warn] window 0 train split can't fit/calibrate this model -- skipping"
+        )
+        return None
     proba_train = model.predict_proba(X_train)[:, 1]
 
     threshold = decide_threshold(
-        y_train, proba_train, threshold_mode, calibrated_recall_target
+        y_train, proba_train, threshold_mode, calibrated_recall_target, model=model
     )
 
     return SourceWindowFit(
@@ -262,12 +290,19 @@ def _explanation_rows(
     LIME's mean local fidelity for this horizon -- fidelity is one number
     per horizon, not per feature, so it doesn't fit explanations.csv's long
     format. Each method's failure is independent -- a LIME crash shouldn't
-    drop the SHAP rows already computed, and vice versa."""
+    drop the SHAP rows already computed, and vice versa.
+
+    Every schema feature is recorded (top_n = full width), not just a top
+    slice -- the per-horizon importance heatmap in the EDA notebook needs a
+    value for every (feature, horizon) cell to avoid holes; it picks its own
+    top-K for display."""
     rows: list[dict] = []
     fidelity_rows: list[dict] = []
     x_explain = sample_rows(X_target, config.explain_sample_n, config.random_seed)
     if x_explain.empty:
         return rows, fidelity_rows
+
+    n_feats = len(feature_names)
 
     horizon_meta = {
         **base_row,
@@ -282,7 +317,7 @@ def _explanation_rows(
             X_background,
             x_explain,
             feature_names,
-            top_n=config.top_n_importances,
+            top_n=n_feats,
         )
         rows.extend(
             {
@@ -303,7 +338,7 @@ def _explanation_rows(
             X_background,
             x_explain,
             feature_names,
-            top_n=config.top_n_importances,
+            top_n=n_feats,
             num_samples=config.lime_num_samples,
             random_state=config.random_seed,
         )

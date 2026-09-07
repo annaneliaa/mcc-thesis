@@ -94,7 +94,11 @@ def main() -> None:
         nargs="+",
         default=["logreg"],
         metavar="MODEL",
-        help="Models to cross with the mining-settings grid (ignored with --shortlist). Default: logreg",
+        help=(
+            "Models to cross with the mining-settings grid (ignored with --shortlist). "
+            "Supervised (logreg, xgboost, rf, ...) or one-class anomaly (iforest, ocsvm -- "
+            "fit on benign rows, Platt-scaled to a probability). Default: logreg"
+        ),
     )
     parser.add_argument(
         "--no-baseline",
@@ -154,14 +158,6 @@ def main() -> None:
         dest="lime_num_samples",
         metavar="N",
         help="Perturbed samples LIME draws per explained row. Default: 1000",
-    )
-    parser.add_argument(
-        "--top-n-importances",
-        type=int,
-        default=30,
-        dest="top_n_importances",
-        metavar="N",
-        help="Top-N features (by |importance|) kept per horizon per method. Default: 30",
     )
     parser.add_argument(
         "--mining-settings",
@@ -251,7 +247,6 @@ def main() -> None:
         explain_background_n=args.explain_background_n,
         explain_sample_n=args.explain_sample_n,
         lime_num_samples=args.lime_num_samples,
-        top_n_importances=args.top_n_importances,
         cache_dir=cache_dir,
         grouping=grouping,
         alerts_json_path=alerts_path,
