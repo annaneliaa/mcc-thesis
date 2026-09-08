@@ -3,9 +3,9 @@ Same experimental setup as cscas_base.py (base schema, training-pool
 sampling, shared eval subsample, 5 seeds) -- swaps RandomForestClassifier
 for XGBClassifier, the "modern default tabular baseline" in the project's
 baseline design (see Docs/Baselines.md). A straight swap of the RF
-pattern: XGBoost, like RF, is tree-based and handles the `-1` sentinel
-values in CSCAS's base schema the same way RF does (splits just treat -1
-as a very low value) -- no scaling, no missingness flags needed, unlike
+pattern: XGBoost, like RF, is tree-based and handles the `-1` "not
+applicable" sentinel the same way RF does (splits just treat -1 as a very
+low value) -- no scaling, no sentinel imputation needed, unlike
 cscas_logreg.py.
 
 Run:
@@ -20,6 +20,14 @@ import pandas as pd
 from sklearn.metrics import precision_score, recall_score, f1_score
 from xgboost import XGBClassifier
 
+from thesis.baselines._cscas_schema import (
+    SCHEMAS_CLASSIFIER,
+    active_schema,
+    cscas_feature_cols,
+    grid_outputs_done,
+    result_name,
+    schema_blurb,
+)
 from thesis.baselines._results import save_baseline_results
 from thesis.baselines._sampling import (
     class_weighted_pool,
@@ -54,24 +62,18 @@ assert len(test) == 1_255_792, f"got {len(test)}"
 assert train["Label"].sum() == 1_765, f"got {train['Label'].sum()}"
 assert test["Label"].sum() == 19_187, f"got {test['Label'].sum()}"
 
-# 4) Reduced base schema -- same 5 columns as cscas_base.py (see that
-# module's docstring for what's dropped and why: SignatureID, SCAS, and
-# every *Similarity column, all unrealistic for a real deployment).
-DROP_COLS = [
-    "Timestamp",
-    "SignatureText",
-    "Label",
-    "ExtIP",
-    "IntIP",
-    "SignatureID",
-    "SCAS",
-]
-FEATURE_COLS = [
-    c for c in df.columns if c not in DROP_COLS and not c.endswith("Similarity")
-]
-assert len(FEATURE_COLS) == 5, f"got {len(FEATURE_COLS)}"
-print(f"Feature count: {len(FEATURE_COLS)}")
+# 4) Feature schema -- CSCAS_SCHEMA env var picks "base" (5 cols, same as
+# cscas_base.py) or "full" (the paper's 42). See _cscas_schema.py.
+SCHEMA = active_schema(SCHEMAS_CLASSIFIER)
+FEATURE_COLS = cscas_feature_cols(df, schema=SCHEMA)
+print(f"Schema: {SCHEMA} -- {len(FEATURE_COLS)} feature columns")
 print(FEATURE_COLS)
+
+if grid_outputs_done(["cscas_xgboost"], SCHEMA):
+    print(
+        f"[skip] cscas_xgboost {SCHEMA} outputs already exist (CSCAS_FORCE=1 to re-run)."
+    )
+    raise SystemExit(0)
 
 # 5) Verify training pools against Table IV (pool construction itself
 # lives in _sampling.py -- these are just the sanity-check counts).
@@ -83,13 +85,17 @@ assert len(important) == 1_765, f"got {len(important)}"
 assert len(irr_inliers) == 133_614, f"got {len(irr_inliers)}"
 assert len(irr_outliers) == 4_153, f"got {len(irr_outliers)}"
 
-# 6) Prepare eval set -- shared, frozen subsample (not the full test set --
-# that's reserved for the paper-replication script only).
-eval_df = get_cscas_eval_subsample(test)
-X_test = eval_df[FEATURE_COLS].values
-y_test = eval_df["Label"].values
+# 6) Prepare eval sets -- both cells of the test-set axis.
+#   subsample: shared, frozen 20k -- the grid every baseline lives in.
+#   fulltest:  all 1.26M test rows -- the CSCAS paper's own protocol.
+_eval_sub = get_cscas_eval_subsample(test)
+EVAL_SETS = {
+    "subsample": (_eval_sub[FEATURE_COLS].values, _eval_sub["Label"].values),
+    "fulltest": (test[FEATURE_COLS].values, test["Label"].values),
+}
 print(
-    f"Evaluating on shared eval subsample: {len(eval_df)} rows, {int(eval_df['Label'].sum())} positive"
+    f"Evaluating on: subsample ({len(_eval_sub)} rows, {int(_eval_sub['Label'].sum())} pos)"
+    f"  +  full test ({len(test)} rows, {int(test['Label'].sum())} pos)"
 )
 
 # 7) Three training-pool conditions
@@ -105,11 +111,14 @@ REFERENCE = {
     "guided": "P=0.868, R=0.952, F1=0.908",
 }
 
-results: dict[str, list[dict[str, float]]] = {name: [] for name in POOL_BUILDERS}
+# results[eval_set][condition] -> list of per-seed metric dicts
+results: dict[str, dict[str, list[dict[str, float]]]] = {
+    ek: {name: [] for name in POOL_BUILDERS} for ek in EVAL_SETS
+}
 
 for condition, build_pool in POOL_BUILDERS.items():
     reference = REFERENCE[condition]
-    print(f"\n=== {condition} (XGBoost, reduced base schema) ===")
+    print(f"\n=== {condition} (XGBoost, {SCHEMA} schema) ===")
     if reference:
         print(
             f"    Paper reference (RF, 42 numeric features, full test set): {reference}"
@@ -128,37 +137,33 @@ for condition, build_pool in POOL_BUILDERS.items():
             scale_pos_weight=extra_kwargs.get("scale_pos_weight"),
         )
         clf.fit(X_tr, y_tr)
-        y_pred = clf.predict(X_test)
 
-        p = precision_score(y_test, y_pred)
-        r = recall_score(y_test, y_pred)
-        f = f1_score(y_test, y_pred)
-        results[condition].append({"precision": p, "recall": r, "f1": f})
-        print(f"  seed={seed}: P={p:.3f} R={r:.3f} F1={f:.3f}")
+        row = []
+        for ek, (X_ev, y_ev) in EVAL_SETS.items():
+            y_pred = clf.predict(X_ev)
+            m = {
+                "precision": precision_score(y_ev, y_pred),
+                "recall": recall_score(y_ev, y_pred),
+                "f1": f1_score(y_ev, y_pred),
+            }
+            results[ek][condition].append(m)
+            row.append(f"{ek} F1={m['f1']:.3f}")
+        print(f"  seed={seed}: " + "  |  ".join(row))
 
-    avg = pd.DataFrame(results[condition]).mean()
-    print(f"  AVERAGE: P={avg.precision:.3f} R={avg.recall:.3f} F1={avg.f1:.3f}")
+    for ek in EVAL_SETS:
+        avg = pd.DataFrame(results[ek][condition]).mean()
+        print(
+            f"  AVERAGE [{ek}]: P={avg.precision:.3f} R={avg.recall:.3f} F1={avg.f1:.3f}"
+        )
 
 
-print(
-    "\n=== Summary: paper (RF, 42 features, full test set) vs "
-    "XGBoost (reduced base schema, shared eval subsample) ==="
-)
-for condition, reference in REFERENCE.items():
-    avg = pd.DataFrame(results[condition]).mean()
-    ref_str = f"paper {reference}  |  " if reference else ""
-    print(
-        f"{condition:<16}"
-        f"{ref_str}"
-        f"mine P={avg.precision:.3f} R={avg.recall:.3f} F1={avg.f1:.3f}"
+for ek in EVAL_SETS:
+    save_baseline_results(
+        name=result_name("cscas_xgboost", SCHEMA, ek),
+        description=(
+            f"{schema_blurb(SCHEMA, len(FEATURE_COLS))}, "
+            f"XGBClassifier(n_estimators=100), evaluated on the "
+            f"{'shared 20k eval subsample' if ek == 'subsample' else 'full 1.26M-row test set'}"
+        ),
+        results=results[ek],
     )
-
-save_baseline_results(
-    name="cscas_xgboost",
-    description=(
-        "Reduced base schema (5 features -- SignatureID, SCAS, and all "
-        "Similarity columns removed as unrealistic for a real deployment), "
-        "XGBClassifier(n_estimators=100), evaluated on the shared eval subsample"
-    ),
-    results=results,
-)

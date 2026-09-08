@@ -22,11 +22,26 @@ cut for a one-class model (a flat 0.5 in Platt-probability space would
 predict everything benign on this imbalance). "calibrated_recall" tunes the
 threshold to a target recall on W_src instead.
 
-W_src is always window 0 -- there is no other source-window role. For a
-given granularity g, the timeline is carved into n(g) windows exactly as in
-screening_sweep.py (pipeline.compute_window_bounds), and window 0 has its
-own internal train/test split (pipeline.compute_window_train_end, same
-70/30 default as the screening sweep):
+The source window W_src depends on config.source_split_mode (see
+WindowScheme):
+
+  * "window0" (default): W_src is window 0. For a given granularity g the
+    timeline is carved into n(g) windows exactly as in screening_sweep.py
+    (pipeline.compute_window_bounds); the walk covers windows
+    1..n_windows-1.
+  * "baseline_split": W_src is every alert_group at or before
+    config.source_split_time -- the CSCAS baseline's own chronological
+    train/test boundary (baselines/cscas_base.py). The walk carves the
+    post-split_time remainder (the baseline's test period) into windows at
+    granularity g, so the h=1..n_windows-1 decay curve lines up one-to-one
+    with the single aggregate score the baseline reports on that same test
+    set. Symbolic schemas for this mode are mined via
+    window_schema_cache.get_or_mine_slice_attribute_schema (explicit slice
+    bounds) rather than the (gran, win_idx) windowed entry point.
+
+W_src always has its own internal train/test split
+(pipeline.compute_window_train_end, same 70/30 default as the screening
+sweep):
 
   1. Mine a schema on window 0's *train* split only
      (mining.window_schema_cache.get_or_mine_window_attribute_schema --
@@ -96,7 +111,10 @@ from thesis.experiments._shared import (
 )
 from thesis.features.persistence import load_symbolic_feature_schema
 from thesis.metrics.shortlist import ShortlistedConfig, load_shortlist
-from thesis.mining.window_schema_cache import get_or_mine_window_attribute_schema
+from thesis.mining.window_schema_cache import (
+    get_or_mine_slice_attribute_schema,
+    get_or_mine_window_attribute_schema,
+)
 from thesis.paths import ensure_artifact_dirs
 from thesis.pipeline.pipeline import compute_window_bounds, compute_window_train_end
 from thesis.schemas.experiments import TemporalDecayConfig
@@ -108,6 +126,88 @@ from thesis.training.explain import (
 
 _ROOT = Path(__file__).resolve().parents[3]
 _EXPERIMENTS_DIR = _ROOT / "artifacts" / "experiments" / "temporal_decay"
+
+
+@dataclass(slots=True)
+class WindowScheme:
+    """How the source window and the forward horizon windows are carved out
+    of the full chronologically-sorted alert_groups list -- see
+    TemporalDecayConfig.source_split_mode.
+
+    "window0": W_src is window 0 of compute_window_bounds at the config's
+    granularity; the walk covers windows 1..n_windows-1 of the whole
+    timeline.
+
+    "baseline_split": W_src is alert_groups[:split_idx] (every group at or
+    before the baseline's split_time -- see baselines/cscas_base.py); the
+    walk carves alert_groups[split_idx:] (the baseline's own test period)
+    into windows at the config's granularity, indexed h=1..n_windows-1, so
+    the decay curve lines up one-to-one with the single aggregate score the
+    baseline reports on that same test set."""
+
+    mode: str
+    n_total: int
+    split_idx: int | None = None
+
+    def n_windows(self, gran: float) -> int:
+        if self.mode == "baseline_split":
+            n_fwd = compute_window_bounds(self.n_total - self.split_idx, gran, 0)[2]
+            return n_fwd + 1
+        return compute_window_bounds(self.n_total, gran, 0)[2]
+
+    def source_bounds(self, gran: float) -> tuple[int, int]:
+        if self.mode == "baseline_split":
+            return 0, self.split_idx
+        start, end, _ = compute_window_bounds(self.n_total, gran, 0)
+        return start, end
+
+    def target_bounds(self, gran: float, horizon: int) -> tuple[int, int]:
+        """Absolute [start, end) row bounds of horizon window `horizon` (>= 1)."""
+        if self.mode == "baseline_split":
+            start, end, _ = compute_window_bounds(
+                self.n_total - self.split_idx, gran, horizon - 1
+            )
+            return start + self.split_idx, end + self.split_idx
+        start, end, _ = compute_window_bounds(self.n_total, gran, horizon)
+        return start, end
+
+
+def _resolve_baseline_split_idx(alert_groups: list, split_time_iso: str) -> int:
+    """Count of alert_groups whose start_ts is at or before `split_time_iso`
+    -- the index at which the baseline's chronological train/test boundary
+    falls, matching cscas_base.py's `df["Timestamp"] <= split_time` train
+    mask. alert_groups is assumed sorted ascending by start_ts (epoch
+    seconds), which load_scenario_context guarantees."""
+    cutoff = int(pd.Timestamp(split_time_iso).timestamp())
+    lo, hi = 0, len(alert_groups)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if (alert_groups[mid].start_ts or 0) <= cutoff:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
+
+
+def _build_window_scheme(
+    config: TemporalDecayConfig, alert_groups: list, n_total: int
+) -> WindowScheme:
+    if config.source_split_mode != "baseline_split":
+        return WindowScheme("window0", n_total)
+
+    split_idx = _resolve_baseline_split_idx(alert_groups, config.source_split_time)
+    if not 0 < split_idx < n_total:
+        raise ValueError(
+            f"baseline split_time {config.source_split_time!r} puts the "
+            f"train/test boundary at index {split_idx} of {n_total} -- expected "
+            "it strictly inside the timeline."
+        )
+    print(
+        f"  [source=baseline_split] split_time={config.source_split_time} → "
+        f"W_src = alert_groups[:{split_idx}] ({split_idx / n_total:.1%} of "
+        f"{n_total}); walk carves the remaining {n_total - split_idx}"
+    )
+    return WindowScheme("baseline_split", n_total, split_idx)
 
 
 @dataclass(slots=True)
@@ -130,6 +230,7 @@ class SourceWindowFit:
     X_train: pd.DataFrame
     X_test: pd.DataFrame
     y_test: np.ndarray
+    scheme: WindowScheme
 
 
 def fit_source_window(
@@ -145,15 +246,19 @@ def fit_source_window(
     threshold_mode: str,
     calibrated_recall_target: float,
     force_remine: bool = False,
+    scheme: WindowScheme | None = None,
 ) -> SourceWindowFit | None:
-    """Mine (if `cfg.feature_set == "symbolic"`) on window 0's train split,
-    fit `cfg.model` on that same train split, and decide a frozen threshold
-    from its own scores. Returns None (with a warning printed, never raises)
-    if the mining setting can't be resolved or window 0's train split turns
-    out to be single-class -- both non-fatal, "this config can't run"
-    conditions the caller is expected to skip past."""
+    """Mine (if `cfg.feature_set == "symbolic"`) on the source window's train
+    split, fit `cfg.model` on that same train split, and decide a frozen
+    threshold from its own scores. `scheme` picks what the source window is
+    (default: window 0 at the config's granularity -- see WindowScheme).
+    Returns None (with a warning printed, never raises) if the mining
+    setting can't be resolved or the train split turns out to be
+    single-class -- both non-fatal, "this config can't run" conditions the
+    caller is expected to skip past."""
     gran = cfg.granularity
-    _, _, n_windows = compute_window_bounds(n_total, gran, 0)
+    scheme = scheme or WindowScheme("window0", n_total)
+    n_windows = scheme.n_windows(gran)
 
     spec = None
     if cfg.feature_set == "symbolic":
@@ -165,7 +270,7 @@ def fit_source_window(
             )
             return None
 
-    win_start, win_end, _ = compute_window_bounds(n_total, gran, 0)
+    win_start, win_end = scheme.source_bounds(gran)
     win_train_end = compute_window_train_end(
         win_start, win_end, train_frac_within_window
     )
@@ -175,13 +280,37 @@ def fit_source_window(
     n_attack_src = int(np.nansum(labels))
 
     print(
-        f"  [W_src=window 0] n={len(window_rows)} attack={n_attack_src} "
-        f"train_end(local)={local_train_end}"
+        f"  [W_src={scheme.mode}] rows[{win_start}:{win_end}] n={len(window_rows)} "
+        f"attack={n_attack_src} train_end(local)={local_train_end}"
     )
 
     cache_hit = None
     if cfg.feature_set == "baseline":
         schema = base_schema
+    elif scheme.mode == "baseline_split":
+        tf_tag = f"{train_frac_within_window:.6f}".rstrip("0").rstrip(".")
+        schema_result = get_or_mine_slice_attribute_schema(
+            scenario=scenario,
+            alert_groups=alert_groups,
+            alert_groups_path=alert_groups_path,
+            slice_start=win_start,
+            slice_end=win_train_end,
+            slice_tag=f"baseline_split_train{tf_tag}",
+            attribute_mining_config=spec.to_attribute_mining_config(),
+            force=force_remine,
+        )
+        symbolic = load_symbolic_feature_schema(schema_result.schema_path)
+        schema = FeatureSchema(
+            schema_name="base+symbolic",
+            schema_version=symbolic.schema_version,
+            base=base_schema.base,
+            symbolic=symbolic,
+        )
+        cache_hit = schema_result.cache_hit
+        print(
+            f"    [{cfg.mining_setting}] {'cache hit' if cache_hit else 'mined fresh'} "
+            f"({len(symbolic.features)} features)"
+        )
     else:
         schema_result = get_or_mine_window_attribute_schema(
             scenario=scenario,
@@ -217,7 +346,7 @@ def fit_source_window(
     y_test = y_masked[local_train_end_masked:]
 
     if len(np.unique(y_train)) < 2:
-        print("    [warn] window 0 train split is single-class -- skipping")
+        print("    [warn] W_src train split is single-class -- skipping")
         return None
 
     # fit_scored_model returns something exposing predict_proba(X)[:, 1] as
@@ -230,9 +359,7 @@ def fit_source_window(
     #    split so their anomaly score reads as a probability downstream.
     model = fit_scored_model(cfg.model, X_train, y_train)
     if model is None:
-        print(
-            "    [warn] window 0 train split can't fit/calibrate this model -- skipping"
-        )
+        print("    [warn] W_src train split can't fit/calibrate this model -- skipping")
         return None
     proba_train = model.predict_proba(X_train)[:, 1]
 
@@ -251,21 +378,28 @@ def fit_source_window(
         X_train=X_train,
         X_test=X_test,
         y_test=y_test,
+        scheme=scheme,
     )
 
 
 def encode_target_window(
     alert_groups: list,
-    n_total: int,
+    scheme: "WindowScheme | int",
     gran: float,
     win_idx: int,
     schema: FeatureSchema,
 ) -> tuple[pd.DataFrame, np.ndarray, int]:
-    """Encode window `win_idx` under a (frozen) schema, dropping unlabelled
-    rows. Returns (X, y, n_alert_groups_in_window) -- the third value keeps
-    the *unmasked* window size available for reporting even though X/y only
-    cover labeled rows."""
-    t_start, t_end, _ = compute_window_bounds(n_total, gran, win_idx)
+    """Encode horizon window `win_idx` (>= 1) under a (frozen) schema,
+    dropping unlabelled rows. Returns (X, y, n_alert_groups_in_window) --
+    the third value keeps the *unmasked* window size available for
+    reporting even though X/y only cover labeled rows.
+
+    `scheme` may be a WindowScheme or, for backward compatibility with
+    callers that predate it (rolling_walk_forward.py), a bare `n_total`
+    int -- treated as a "window0" scheme over that many rows."""
+    if not isinstance(scheme, WindowScheme):
+        scheme = WindowScheme("window0", int(scheme))
+    t_start, t_end = scheme.target_bounds(gran, win_idx)
     target_rows = alert_groups[t_start:t_end]
     t_labels, t_mask = labels_and_mask(target_rows)
 
@@ -411,6 +545,8 @@ def run_temporal_decay_experiment(config: TemporalDecayConfig) -> Path:
     mining_settings_by_name = ctx.mining_settings_by_name
     mining_settings_path = ctx.mining_settings_path
 
+    scheme = _build_window_scheme(config, alert_groups, n_total)
+
     print("[4/4] Loading shortlist...")
     shortlist = load_shortlist(config.shortlist_path)
     print(f"  {len(shortlist)} shortlisted configs")
@@ -436,6 +572,7 @@ def run_temporal_decay_experiment(config: TemporalDecayConfig) -> Path:
                 alert_groups=alert_groups,
                 alert_groups_path=alert_groups_path,
                 n_total=n_total,
+                scheme=scheme,
                 base_schema=base_schema,
                 mining_settings_by_name=mining_settings_by_name,
                 mining_settings_path=mining_settings_path,
@@ -492,6 +629,12 @@ def run_temporal_decay_experiment(config: TemporalDecayConfig) -> Path:
             if config.threshold_mode == "calibrated_recall"
             else ""
         ),
+        f"Source window: {config.source_split_mode}"
+        + (
+            f" (split_time={config.source_split_time})"
+            if config.source_split_mode == "baseline_split"
+            else ""
+        ),
         f"Explanations: {'on' if config.compute_explanations else 'off'} "
         f"(background_n={config.explain_background_n}, sample_n={config.explain_sample_n}, "
         f"lime_num_samples={config.lime_num_samples})",
@@ -525,6 +668,7 @@ def _run_one_config(
     base_schema: FeatureSchema,
     mining_settings_by_name: dict,
     mining_settings_path: Path,
+    scheme: WindowScheme | None = None,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     print(
         f"\n[{cfg.feature_set}/{cfg.mining_setting}/gran={cfg.granularity:g}] starting"
@@ -536,6 +680,7 @@ def _run_one_config(
         alert_groups=alert_groups,
         alert_groups_path=alert_groups_path,
         n_total=n_total,
+        scheme=scheme,
         base_schema=base_schema,
         mining_settings_by_name=mining_settings_by_name,
         mining_settings_path=mining_settings_path,
@@ -631,7 +776,7 @@ def _run_one_config(
 
     for k in range(1, fit.n_windows):
         X_tgt, y_tgt, n_alert_groups = encode_target_window(
-            alert_groups, n_total, fit.gran, k, fit.schema
+            alert_groups, fit.scheme, fit.gran, k, fit.schema
         )
         _record_horizon(k, X_tgt, y_tgt, n_alert_groups)
 

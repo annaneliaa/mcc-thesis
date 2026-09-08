@@ -6,13 +6,63 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from thesis.system_eval.temporal_decay import _build_decay_summary
+from thesis.system_eval.temporal_decay import (
+    WindowScheme,
+    _build_decay_summary,
+    _resolve_baseline_split_idx,
+)
 from thesis.experiments._shared import (
     decide_threshold,
     fit_scored_model,
     metrics_at_threshold,
 )
 from thesis.metrics.shortlist import load_shortlist
+from thesis.pipeline.pipeline import compute_window_bounds
+
+
+# ---- WindowScheme -----------------------------------------------------------
+
+
+@pytest.mark.parametrize("gran", [0.1, 0.25, 0.5])
+def test_window_scheme_window0_matches_compute_window_bounds(gran):
+    n = 1_000_000
+    s = WindowScheme("window0", n)
+    assert s.n_windows(gran) == compute_window_bounds(n, gran, 0)[2]
+    assert s.source_bounds(gran) == compute_window_bounds(n, gran, 0)[:2]
+    assert s.target_bounds(gran, 3) == compute_window_bounds(n, gran, 3)[:2]
+
+
+@pytest.mark.parametrize("gran", [0.1, 0.25, 0.5])
+def test_window_scheme_baseline_split_walks_only_the_post_split_tail(gran):
+    n, split = 1_000_000, 100_000
+    s = WindowScheme("baseline_split", n, split)
+    n_fwd = compute_window_bounds(n - split, gran, 0)[2]
+    # h=0 anchor + one horizon per post-split window
+    assert s.n_windows(gran) == n_fwd + 1
+    # W_src is the whole pre-split region
+    assert s.source_bounds(gran) == (0, split)
+    # h=1 starts exactly at the split; the last horizon ends at the timeline end
+    assert s.target_bounds(gran, 1)[0] == split
+    assert s.target_bounds(gran, n_fwd)[1] == n
+    # horizons are contiguous and never re-enter the training region
+    prev_end = split
+    for h in range(1, n_fwd + 1):
+        start, end = s.target_bounds(gran, h)
+        assert start == prev_end
+        prev_end = end
+
+
+def test_resolve_baseline_split_idx_matches_leq_cutoff():
+    cutoff_iso = "2022-01-26 06:23:21+02:00"
+    cut = int(pd.Timestamp(cutoff_iso).timestamp())
+
+    class _G:
+        def __init__(self, ts):
+            self.start_ts = ts
+
+    groups = [_G(cut - 100), _G(cut - 1), _G(cut), _G(cut + 1), _G(cut + 100)]
+    # groups at or before the cutoff go to train (mirrors `Timestamp <= split_time`)
+    assert _resolve_baseline_split_idx(groups, cutoff_iso) == 3
 
 
 # ---- _build_decay_summary ----------------------------------------------------

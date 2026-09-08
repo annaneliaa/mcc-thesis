@@ -37,6 +37,15 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import OneClassSVM
 
+from thesis.baselines._cscas_schema import (
+    SCHEMAS_ANOMALY,
+    active_schema,
+    cscas_feature_cols,
+    grid_outputs_done,
+    result_name,
+    schema_blurb,
+    sentinel_imputer,
+)
 from thesis.baselines._results import save_anomaly_results
 from thesis.baselines._sampling import get_cscas_eval_subsample
 from thesis.encoders.symbolic import SymbolicFeatureEncoder
@@ -79,36 +88,50 @@ assert test["Label"].sum() == 19_187, f"got {test['Label'].sum()}"
 # symbolic_train_df because of this invariant.
 assert list(train.index) == list(range(len(train)))
 
-# 4) Define feature columns -- same reduced base schema as cscas_base.py.
-DROP_COLS = [
-    "Timestamp",
-    "SignatureText",
-    "Label",
-    "ExtIP",
-    "IntIP",
-    "SignatureID",
-    "SCAS",
-]
-FEATURE_COLS = [
-    c for c in df.columns if c not in DROP_COLS and not c.endswith("Similarity")
-]
-assert len(FEATURE_COLS) == 5, f"got {len(FEATURE_COLS)}"
-print(f"Base feature count: {len(FEATURE_COLS)}")
+# 4) Feature schema -- CSCAS_SCHEMA env var picks "base" (5 cols),
+# "full_noscas" (40) or "full_scas" (41, SCAS kept -- deliberately-circular
+# diagnostic). Mined symbolic features are added on top. See _cscas_schema.py.
+SCHEMA = active_schema(SCHEMAS_ANOMALY)
+FEATURE_COLS = cscas_feature_cols(df, schema=SCHEMA)
+print(
+    f"Base schema: {SCHEMA} -- {len(FEATURE_COLS)} feature columns (+ mined symbolic)"
+)
 print(FEATURE_COLS)
 
-# 5) Shared, frozen eval subsample (same as cscas_base.py/cscas_mining.py).
+# 4b) OneClassSVM is scale-sensitive, so the -1 "not applicable" sentinel is
+# median-imputed inside the Pipeline (sentinel_imputer, fit on the benign
+# train rows only); the mined symbolic columns are binary with no -1 and pass
+# through untouched. See _cscas_schema.py.
+
+# 4c) Skip early (before the minutes-long mining pass) if both result files
+# for this schema already exist.
+NEEDED = {
+    ek: result_name("cscas_mining_anomaly_ocsvm", SCHEMA, ek)
+    for ek in ("subsample", "fulltest")
+}
+if grid_outputs_done(["cscas_mining_anomaly_ocsvm"], SCHEMA):
+    print(f"[skip] {list(NEEDED.values())} already exist (CSCAS_FORCE=1 to re-run).")
+    raise SystemExit(0)
+
+# 5) Eval sets -- both cells of the test-set axis.
 eval_df = get_cscas_eval_subsample(test)
+EVAL_FRAMES = {"subsample": eval_df, "fulltest": test}
 print(
-    f"Evaluating on shared eval subsample: {len(eval_df)} rows, {int(eval_df['Label'].sum())} positive"
+    f"Evaluating on: subsample ({len(eval_df)} rows, {int(eval_df['Label'].sum())} pos)"
+    f"  +  full test ({len(test)} rows, {int(test['Label'].sum())} pos)"
 )
 
 # 6) Build AlertGroups for train and eval -- same per-row parser
-# cscas_mining.py uses.
+# cscas_mining.py uses. The full-test parse+encode is the slow step.
 print("Building AlertGroups for train/eval splits...")
 train_groups = rows_to_cscas_alert_groups(train.to_dict("records"))
-eval_groups = rows_to_cscas_alert_groups(eval_df.to_dict("records"))
+eval_groups = {
+    ek: rows_to_cscas_alert_groups(frame.to_dict("records"))
+    for ek, frame in EVAL_FRAMES.items()
+}
 assert len(train_groups) == len(train), "row parsing dropped rows -- alignment broken"
-assert len(eval_groups) == len(eval_df), "row parsing dropped rows -- alignment broken"
+for ek, groups in eval_groups.items():
+    assert len(groups) == len(EVAL_FRAMES[ek]), f"row parsing dropped {ek} rows"
 
 train_alert_groups_path = (
     CACHE_DIR
@@ -158,71 +181,73 @@ print(f"  Built {len(symbolic_schema.features)} symbolic features.")
 
 encoder = SymbolicFeatureEncoder(feature_schema=symbolic_schema)
 symbolic_train_df = encoder.transform(train_groups)
-symbolic_eval_df = encoder.transform(eval_groups)
+symbolic_eval_df = {ek: encoder.transform(groups) for ek, groups in eval_groups.items()}
 
 # 8) Benign-only training data -- no pool conditions, no undersampling.
 train_benign = train[train["Label"] == 0]
 print(f"Training on {len(train_benign)} benign-only rows (natural count)")
 
+
+def _matrix(base_frame: pd.DataFrame, symbolic_df: pd.DataFrame):
+    return pd.concat(
+        [
+            base_frame[FEATURE_COLS].reset_index(drop=True),
+            symbolic_df.reset_index(drop=True),
+        ],
+        axis=1,
+    ).values
+
+
 # train_benign.index gives positions into symbolic_train_df (see step 3's
 # invariant).
-X_train = pd.concat(
-    [
-        train_benign[FEATURE_COLS].reset_index(drop=True),
-        symbolic_train_df.iloc[train_benign.index].reset_index(drop=True),
-    ],
-    axis=1,
-).values
-X_test = pd.concat(
-    [
-        eval_df[FEATURE_COLS].reset_index(drop=True),
-        symbolic_eval_df.reset_index(drop=True),
-    ],
-    axis=1,
-).values
-y_test = eval_df["Label"].values
+X_train = _matrix(train_benign, symbolic_train_df.iloc[train_benign.index])
 
-# 9) Fit + score. Same estimator as model_factory's "ocsvm" (StandardScaler
-# + OneClassSVM(kernel='rbf', nu=0.05)), built inline to avoid the classifier
-# factory's heavier deps. Deterministic convex fit, no random_state.
+# 9) Fit once. Same estimator as model_factory's "ocsvm" (StandardScaler +
+# OneClassSVM(kernel='rbf', nu=0.05)), plus a sentinel_imputer() first step,
+# built inline to avoid the classifier factory's heavier deps. Deterministic
+# convex fit, no random_state.
 model = Pipeline(
-    [("scaler", StandardScaler()), ("clf", OneClassSVM(kernel="rbf", nu=0.05))]
+    [
+        ("impute", sentinel_imputer()),
+        ("scaler", StandardScaler()),
+        ("clf", OneClassSVM(kernel="rbf", nu=0.05)),
+    ]
 )
 model.fit(X_train)
 
-scores = -model.decision_function(X_test)  # higher = more anomalous
-y_pred = (model.predict(X_test) == -1).astype(int)  # 1 = anomaly = attack
+for ek, frame in EVAL_FRAMES.items():
+    X_ev = _matrix(frame, symbolic_eval_df[ek])
+    y_ev = frame["Label"].values
 
-auc = roc_auc_score(y_test, scores)
-p = precision_score(y_test, y_pred, zero_division=0)
-r = recall_score(y_test, y_pred, zero_division=0)
-f = f1_score(y_test, y_pred, zero_division=0)
+    scores = -model.decision_function(X_ev)  # higher = more anomalous
+    y_pred = (model.predict(X_ev) == -1).astype(int)  # 1 = anomaly = attack
 
-# Tuned-operating-point view (see cscas_anomaly.py for the rationale):
-# precision / FP / workload-reduction at the threshold hitting each target
-# recall, not the default nu=0.05 cut.
-workload = compute_workload_at_recall(y_test, scores)
+    auc = roc_auc_score(y_ev, scores)
+    p = precision_score(y_ev, y_pred, zero_division=0)
+    r = recall_score(y_ev, y_pred, zero_division=0)
+    f = f1_score(y_ev, y_pred, zero_division=0)
+    workload = compute_workload_at_recall(y_ev, scores)
 
-print("\n=== cscas_mining_anomaly_ocsvm ===")
-print(f"AUC={auc:.3f} P={p:.3f} R={r:.3f} F1={f:.3f}  (default nu=0.05 cut)")
-if workload.get("0.90"):
-    w = workload["0.90"]
-    print(
-        f"  @recall>=0.90: P={w['precision']:.3f} FP={int(w['fp'])} "
-        f"workload_reduction={w['workload_reduction']:.3f}"
+    print(f"\n=== cscas_mining_anomaly_ocsvm [{SCHEMA} / {ek}] ===")
+    print(f"AUC={auc:.3f} P={p:.3f} R={r:.3f} F1={f:.3f}  (default nu=0.05 cut)")
+    if workload.get("0.90"):
+        w = workload["0.90"]
+        print(
+            f"  @recall>=0.90: P={w['precision']:.3f} FP={int(w['fp'])} "
+            f"workload_reduction={w['workload_reduction']:.3f}"
+        )
+
+    save_anomaly_results(
+        name=NEEDED[ek],
+        description=(
+            "OneClassSVM(kernel='rbf', nu=0.05) fit on benign-only rows of the "
+            f"{schema_blurb(SCHEMA, len(FEATURE_COLS))} + attribute-mined "
+            "symbolic features (mined on the same train split as cscas_mining; "
+            "SCAS/Similarity-derived fields excluded from mining), evaluated on "
+            f"the {'shared 20k eval subsample' if ek == 'subsample' else 'full 1.26M-row test set'}. "
+            "No attack rows used in training. precision/recall/f1 at the default "
+            "nu=0.05 cut; workload_at_recall is the tuned-threshold view."
+        ),
+        metrics={"auc": auc, "precision": p, "recall": r, "f1": f},
+        workload=workload,
     )
-
-save_anomaly_results(
-    name="cscas_mining_anomaly_ocsvm",
-    description=(
-        "OneClassSVM(kernel='rbf', nu=0.05) fit on benign-only rows of "
-        "the base schema (5 features) + attribute-mined symbolic features "
-        "(contrast-set + decision-tree rules, mined on the same train "
-        "split as cscas_mining; SCAS/Similarity-derived fields excluded "
-        "from mining), evaluated on the shared eval subsample. No attack "
-        "rows used in training. precision/recall/f1 at the default nu=0.05 "
-        "cut; workload_at_recall is the tuned-threshold view."
-    ),
-    metrics={"auc": auc, "precision": p, "recall": r, "f1": f},
-    workload=workload,
-)

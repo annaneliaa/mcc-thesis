@@ -23,9 +23,11 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import precision_score, recall_score, f1_score
 
-from thesis.baselines._results import save_baseline_results
+from thesis.baselines._cscas_schema import force_recompute
+from thesis.baselines._results import results_exist, save_baseline_results
 from thesis.baselines._sampling import (
     class_weighted_pool,
+    get_cscas_eval_subsample,
     guided_by_cscas_pool,
     random_undersample_pool,
 )
@@ -67,6 +69,12 @@ FEATURE_COLS = [c for c in df.columns if c not in DROP_COLS]
 print(f"Feature count: {len(FEATURE_COLS)}")
 print(FEATURE_COLS)
 
+if not force_recompute() and all(
+    results_exist(n) for n in ("cscas", "cscas_subsample")
+):
+    print("[skip] cscas + cscas_subsample already exist (CSCAS_FORCE=1 to re-run).")
+    raise SystemExit(0)
+
 # 5) Verify training pools against Table IV (pool construction itself now
 # lives in _sampling.py -- these are just the sanity-check counts).
 important = train[train["Label"] == 1]
@@ -77,9 +85,18 @@ assert len(important) == 1_765, f"got {len(important)}"
 assert len(irr_inliers) == 133_614, f"got {len(irr_inliers)}"
 assert len(irr_outliers) == 4_153, f"got {len(irr_outliers)}"
 
-# 6) Prepare test set -- full test set for every condition (see docstring).
+# 6) Prepare test sets. The full test set is the replication protocol (see
+# docstring). We ALSO score every fitted model on the shared 20k eval
+# subsample -- same fitted models, a second .predict() -- so the 42-feature
+# RF has a cell in the shared-subsample comparison grid the other baselines
+# live in (-> results/cscas_subsample.json). The primary results/cscas.json
+# output is unchanged.
 X_test = test[FEATURE_COLS].values
 y_test = test["Label"].values
+
+eval_sub = get_cscas_eval_subsample(test)
+X_sub = eval_sub[FEATURE_COLS].values
+y_sub = eval_sub["Label"].values
 
 # 7) Three training-pool conditions
 POOL_BUILDERS = {
@@ -95,6 +112,16 @@ TARGETS = {
 }
 
 results: dict[str, list[dict[str, float]]] = {name: [] for name in POOL_BUILDERS}
+results_sub: dict[str, list[dict[str, float]]] = {name: [] for name in POOL_BUILDERS}
+
+
+def _metrics(y_true, y_pred) -> dict[str, float]:
+    return {
+        "precision": precision_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred),
+        "f1": f1_score(y_true, y_pred),
+    }
+
 
 for condition, build_pool in POOL_BUILDERS.items():
     target = TARGETS[condition]
@@ -115,16 +142,20 @@ for condition, build_pool in POOL_BUILDERS.items():
             class_weight=extra_kwargs.get("class_weight"),
         )
         clf.fit(X_tr, y_tr)
-        y_pred = clf.predict(X_test)
 
-        p = precision_score(y_test, y_pred)
-        r = recall_score(y_test, y_pred)
-        f = f1_score(y_test, y_pred)
-        results[condition].append({"precision": p, "recall": r, "f1": f})
-        print(f"  seed={seed}: P={p:.3f} R={r:.3f} F1={f:.3f}")
+        m_full = _metrics(y_test, clf.predict(X_test))
+        m_sub = _metrics(y_sub, clf.predict(X_sub))
+        results[condition].append(m_full)
+        results_sub[condition].append(m_sub)
+        print(
+            f"  seed={seed}: full  P={m_full['precision']:.3f} R={m_full['recall']:.3f} F1={m_full['f1']:.3f}"
+            f"   |  subsample  P={m_sub['precision']:.3f} R={m_sub['recall']:.3f} F1={m_sub['f1']:.3f}"
+        )
 
     avg = pd.DataFrame(results[condition]).mean()
-    print(f"  AVERAGE: P={avg.precision:.3f} R={avg.recall:.3f} F1={avg.f1:.3f}")
+    print(
+        f"  AVERAGE (full test): P={avg.precision:.3f} R={avg.recall:.3f} F1={avg.f1:.3f}"
+    )
 
 
 # Scenario                          Expected P      Expected R  Expected F1
@@ -136,4 +167,13 @@ save_baseline_results(
     name="cscas",
     description="Paper's own 42 raw features, RandomForestClassifier(n_estimators=100)",
     results=results,
+)
+save_baseline_results(
+    name="cscas_subsample",
+    description=(
+        "Paper's own 42 raw features, RandomForestClassifier(n_estimators=100), "
+        "scored on the shared frozen 20k eval subsample (same fitted models as "
+        "cscas.json -- this is the 42-feature / subsample cell of the comparison grid)"
+    ),
+    results=results_sub,
 )

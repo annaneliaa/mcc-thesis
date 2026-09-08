@@ -1,8 +1,8 @@
 """
 Shared training-pool construction for every trainable CSCAS baseline
-(cscas.py, cscas_base.py, cscas_bert.py, and future cscas_logreg.py /
-cscas_xgboost.py / cscas_securebert.py), plus the shared, frozen evaluation
-subsample used by every non-replication baseline.
+(cscas.py, cscas_base.py, cscas_bert.py, cscas_logreg.py, cscas_xgboost.py,
+cscas_securebert.py, ...), plus the shared, frozen evaluation subsample
+every CSCAS baseline scores on.
 
 Three pool-construction strategies, one function each:
   - random_undersample_pool: naive random undersampling of the majority
@@ -133,9 +133,11 @@ def get_cscas_eval_subsample(
     seed: int = EVAL_SUBSAMPLE_SEED,
 ) -> pd.DataFrame:
     """Shared, frozen stratified-proportional subsample of the CSCAS test
-    set, used by every non-replication CSCAS baseline and mandatorily by
-    zero-shot. NOT used by cscas.py/cscas_base.py, which stay on the full
-    test set forever (paper replication).
+    set. Every CSCAS baseline scores on it: it is the primary eval for the
+    non-replication baselines and mandatory for zero-shot, and cscas.py /
+    cscas_base.py additionally score their fitted models here (as well as on
+    the full test set) so the feature-schema x test-set comparison grid has
+    every cell filled.
 
     Builds once with a fixed seed and persists row indices to disk on
     first call; every later call across every script loads the same rows

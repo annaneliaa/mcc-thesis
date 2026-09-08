@@ -1,46 +1,47 @@
 #!/usr/bin/env bash
-# Overnight batch runner: every implemented baseline (cscas.py,
-# cscas_base.py, cscas_mining.py, cscas_logreg.py, cscas_xgboost.py,
-# cscas_bert.py, cscas_securebert.py, cscas_anomaly.py,
-# cscas_anomaly_iforest.py, cscas_mining_anomaly.py,
-# cscas_mining_anomaly_iforest.py), followed by re-executing the comparison
-# notebook so every plot is baked in and ready to look at in the morning.
+# Overnight batch runner for the full CSCAS baseline grid, followed by
+# re-executing the comparison notebook so every plot is baked in and ready
+# to look at in the morning.
 #
-# Does NOT run cscas_zeroshot.py -- gated (needs a Llama 3.1 license
-# acceptance + your own Hugging Face auth) and not yet run for real here.
-# The notebook already tolerates its results file being absent (prints a
-# "[skip] ... not found" note and skips the zero-shot plot), so leaving it
-# out of this batch doesn't break the notebook step. Run cscas_zeroshot.py
-# yourself separately once you've confirmed access is set up.
+# THE GRID. Two axes are swept for every non-text baseline:
+#   * feature schema -- CSCAS_SCHEMA env var:
+#       base         5 cols  (deployment-realistic floor)
+#       full         42 cols (the CSCAS paper's own schema) -- classifiers
+#       full_noscas  40 cols (full minus SignatureID + SCAS)  -- anomaly
+#       full_scas    41 cols (full_noscas + SCAS, deliberately circular) -- anomaly
+#   * test set -- swept *inside* each script: the shared 20k eval subsample
+#     AND the full 1.26M-row test set, one result file each.
+# Result files: <stem>[_fullfeat|_fullfeat_scas][_fulltest].json  (a bare
+# stem == base schema / subsample, i.e. the legacy names are unchanged).
 #
-# The 4 tabular scripts (cscas/cscas_base/cscas_logreg/cscas_xgboost) are
-# RF/LogReg/XGBoost -- CPU, seconds per seed regardless of condition count,
-# so re-running all three conditions x 5 seeds every time is cheap; this
-# always re-generates their saved results fresh rather than assuming
-# they're already there.
+# The RF replication pair keeps its legacy layout: cscas.py emits
+# {cscas, cscas_subsample} (42 cols), cscas_base.py emits
+# {cscas_base, cscas_base_fulltest} (5 cols) -- no CSCAS_SCHEMA sweep, those
+# two ARE the RF schema axis.
 #
-# cscas_mining.py now fits all three tabular models on the mined matrix
-# (cscas_mining.json = RF, plus cscas_mining_logreg.json /
-# cscas_mining_xgboost.json) and is per-model resumable -- a model whose
-# JSON exists is skipped unless CSCAS_FORCE=1. If you only want the mining
-# models (not a full overnight redo), run run_cscas_mining.sh instead.
+# Text models (cscas_bert.py / cscas_securebert.py) have no schema axis (the
+# similarity scores are non-textual) -- they only add the full-test eval
+# cell: {cscas_bert, cscas_bert_fulltest}. Does NOT run cscas_zeroshot.py
+# (gated on Ollama; run run_zeroshot.sh separately). The notebook tolerates
+# any missing result file.
 #
-# class_weighted is capped at 15,000 rows (stratified, proportional -- see
-# _sampling.class_weighted_pool) for the two fine-tuned scripts, via
-# CSCAS_CLASS_WEIGHTED_POOL_CAP, so their full N_SEEDS=5 x 3-condition
-# sweeps (15 fine-tune runs each) fit in one overnight run -- uncapped, a
-# single SecureBERT smoke test's class_weighted stage alone measured at
-# 2+ hours remaining at only 16% progress for ONE seed.
+# RESUMABLE. Every script exits early (before any fit / mining pass) when all
+# of its result files for the active CSCAS_SCHEMA already exist, so re-running
+# this after an interrupted night only computes what's missing. Set
+# CSCAS_FORCE=1 to recompute everything regardless.
 #
-# Does not abort on a single script's failure (no `set -e`) -- if one
-# script errors out, its exit code is logged and the run continues to the
-# next step, including the final notebook execution, so partial results
-# still get visualized.
+# COST. The base/full-test cells are free (extra .predict() on already-fitted
+# models). The full-schema cells are quick refits (CPU-seconds/seed for the
+# tabular + anomaly models). cscas_mining* run the attribute-mining pass +
+# symbolic encoding of the full 1.26M-row test set once per schema (minutes).
+# cscas_bert / cscas_securebert add ~15-30 min of full-test inference each
+# (no extra fine-tuning). class_weighted is capped at 15,000 rows for the two
+# fine-tuned scripts via CSCAS_CLASS_WEIGHTED_POOL_CAP.
+#
+# Does not abort on a single script's failure (no `set -e`).
 #
 # Run:
 #   nohup src/thesis/shell-scripts/baselines/run_overnight.sh > /dev/null 2>&1 &
-# (or just `./run_overnight.sh &` in a terminal you're about to close --
-# nohup is the safer bet so a closed terminal/SSH session doesn't kill it)
 
 set -uo pipefail
 
@@ -55,6 +56,12 @@ LOG_FILE="$LOG_DIR/overnight_$(date +%Y%m%d_%H%M%S).log"
 
 export CSCAS_QUICK_SANITY_CHECK=0
 export CSCAS_CLASS_WEIGHTED_POOL_CAP=15000
+CSCAS_FORCE="${CSCAS_FORCE:-0}"
+export CSCAS_FORCE
+
+# Schemas swept per script family.
+CLASSIFIER_SCHEMAS=(base full)
+ANOMALY_SCHEMAS=(base full_noscas full_scas)
 
 run_step() {
     local label="$1"
@@ -70,25 +77,48 @@ run_step() {
     return 0  # never abort the batch on a single step's failure
 }
 
-{
-    echo "=== Overnight baseline run started at $(date) ==="
-    echo "CSCAS_QUICK_SANITY_CHECK=$CSCAS_QUICK_SANITY_CHECK CSCAS_CLASS_WEIGHTED_POOL_CAP=$CSCAS_CLASS_WEIGHTED_POOL_CAP"
+# Run one script once per schema in the given list (CSCAS_SCHEMA scoped to
+# that invocation only). Each script's own early-exit guard skips schemas
+# whose result files already exist.
+run_sweep() {
+    local script="$1"
+    shift
+    local schema
+    for schema in "$@"; do
+        run_step "$script (CSCAS_SCHEMA=$schema)" \
+            env CSCAS_SCHEMA="$schema" "$PYTHON" "$script"
+    done
+}
 
+{
+    echo "=== Overnight baseline grid run started at $(date) ==="
+    echo "CSCAS_QUICK_SANITY_CHECK=$CSCAS_QUICK_SANITY_CHECK" \
+         "CSCAS_CLASS_WEIGHTED_POOL_CAP=$CSCAS_CLASS_WEIGHTED_POOL_CAP" \
+         "CSCAS_FORCE=$CSCAS_FORCE"
+
+    # RF replication pair -- own schema axis, no CSCAS_SCHEMA sweep.
     run_step "cscas.py" "$PYTHON" cscas.py
     run_step "cscas_base.py" "$PYTHON" cscas_base.py
-    run_step "cscas_mining.py" "$PYTHON" cscas_mining.py
-    run_step "cscas_logreg.py" "$PYTHON" cscas_logreg.py
-    run_step "cscas_xgboost.py" "$PYTHON" cscas_xgboost.py
+
+    # Tabular classifiers -- base + full schema.
+    run_sweep cscas_logreg.py "${CLASSIFIER_SCHEMAS[@]}"
+    run_sweep cscas_xgboost.py "${CLASSIFIER_SCHEMAS[@]}"
+    run_sweep cscas_mining.py "${CLASSIFIER_SCHEMAS[@]}"
+
+    # Anomaly detectors -- base + full_noscas + full_scas.
+    run_sweep cscas_anomaly.py "${ANOMALY_SCHEMAS[@]}"
+    run_sweep cscas_anomaly_iforest.py "${ANOMALY_SCHEMAS[@]}"
+    run_sweep cscas_mining_anomaly.py "${ANOMALY_SCHEMAS[@]}"
+    run_sweep cscas_mining_anomaly_iforest.py "${ANOMALY_SCHEMAS[@]}"
+
+    # Text models -- no schema axis, full-test eval added inside the script.
     run_step "cscas_bert.py" "$PYTHON" cscas_bert.py
     run_step "cscas_securebert.py" "$PYTHON" cscas_securebert.py
-    run_step "cscas_anomaly.py" "$PYTHON" cscas_anomaly.py
-    run_step "cscas_anomaly_iforest.py" "$PYTHON" cscas_anomaly_iforest.py
-    run_step "cscas_mining_anomaly.py" "$PYTHON" cscas_mining_anomaly.py
-    run_step "cscas_mining_anomaly_iforest.py" "$PYTHON" cscas_mining_anomaly_iforest.py
+
     run_step "notebook execution" "$PYTHON" -m jupyter nbconvert \
         --to notebook --execute --inplace \
         ../notebooks/baselines/cscas_baseline_comparison.ipynb
 
     echo ""
-    echo "=== Overnight baseline run finished at $(date) ==="
+    echo "=== Overnight baseline grid run finished at $(date) ==="
 } 2>&1 | tee "$LOG_FILE"

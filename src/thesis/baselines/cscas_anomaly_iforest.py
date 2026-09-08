@@ -46,6 +46,14 @@ import pandas as pd
 from sklearn.ensemble import IsolationForest
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
 
+from thesis.baselines._cscas_schema import (
+    SCHEMAS_ANOMALY,
+    active_schema,
+    cscas_feature_cols,
+    grid_outputs_done,
+    result_name,
+    schema_blurb,
+)
 from thesis.baselines._results import save_anomaly_results
 from thesis.baselines._sampling import get_cscas_eval_subsample
 from thesis.training.workload import (
@@ -77,92 +85,92 @@ assert len(test) == 1_255_792, f"got {len(test)}"
 assert train["Label"].sum() == 1_765, f"got {train['Label'].sum()}"
 assert test["Label"].sum() == 19_187, f"got {test['Label'].sum()}"
 
-# 4) Define feature columns -- same reduced set as cscas_base.py.
-DROP_COLS = [
-    "Timestamp",
-    "SignatureText",
-    "Label",
-    "ExtIP",
-    "IntIP",
-    "SignatureID",
-    "SCAS",
-]
-FEATURE_COLS = [
-    c for c in df.columns if c not in DROP_COLS and not c.endswith("Similarity")
-]
-
-assert len(FEATURE_COLS) == 5, f"got {len(FEATURE_COLS)}"
-print(f"Feature count: {len(FEATURE_COLS)}")
+# 4) Feature schema -- CSCAS_SCHEMA env var picks "base" (5 cols),
+# "full_noscas" (40 cols) or "full_scas" (41 cols, SCAS kept -- a
+# deliberately-circular diagnostic for a one-class detector). IsolationForest
+# is tree-based / scale-invariant, so no sentinel imputation. See
+# _cscas_schema.py.
+SCHEMA = active_schema(SCHEMAS_ANOMALY)
+FEATURE_COLS = cscas_feature_cols(df, schema=SCHEMA)
+print(f"Schema: {SCHEMA} -- {len(FEATURE_COLS)} feature columns")
 print(FEATURE_COLS)
+
+if grid_outputs_done(["cscas_anomaly_iforest"], SCHEMA):
+    print(
+        f"[skip] cscas_anomaly_iforest {SCHEMA} outputs already exist (CSCAS_FORCE=1 to re-run)."
+    )
+    raise SystemExit(0)
 
 # 5) Benign-only training data -- no pool conditions, no undersampling.
 train_benign = train[train["Label"] == 0]
 print(f"Training on {len(train_benign)} benign-only rows (natural count)")
 
-# 6) Shared, frozen eval subsample (same as cscas_base.py).
+# 6) Eval sets -- both cells of the test-set axis.
 eval_df = get_cscas_eval_subsample(test)
+EVAL_FRAMES = {"subsample": eval_df, "fulltest": test}
 X_train = train_benign[FEATURE_COLS].values
-X_test = eval_df[FEATURE_COLS].values
-y_test = eval_df["Label"].values
 print(
-    f"Evaluating on shared eval subsample: {len(eval_df)} rows, {int(eval_df['Label'].sum())} positive"
+    f"Evaluating on: subsample ({len(eval_df)} rows, {int(eval_df['Label'].sum())} pos)"
+    f"  +  full test ({len(test)} rows, {int(test['Label'].sum())} pos)"
 )
 
 # 7) Fit + score -- 5 seeds, IsolationForest(random_state=seed), identical
 # benign training rows every seed (nothing to resample -- benign-only fit).
-# Also collect the tuned-operating-point view per seed (precision / FP /
-# workload-reduction at each target recall), seed-averaged before saving.
-seed_metrics: list[dict[str, float]] = []
-seed_workloads: list[dict] = []
-for seed in range(5):
-    model = IsolationForest(
-        n_estimators=100, contamination=0.05, random_state=seed, n_jobs=-1
-    )
-    model.fit(X_train)
+# Every seed's fitted model is scored on both eval sets; the tuned-
+# operating-point view is collected per seed and seed-averaged before saving.
+for ek, frame in EVAL_FRAMES.items():
+    X_ev = frame[FEATURE_COLS].values
+    y_ev = frame["Label"].values
 
-    scores = -model.decision_function(X_test)  # higher = more anomalous
-    y_pred = (model.predict(X_test) == -1).astype(int)  # 1 = anomaly = attack
+    seed_metrics: list[dict[str, float]] = []
+    seed_workloads: list[dict] = []
+    for seed in range(5):
+        model = IsolationForest(
+            n_estimators=100, contamination=0.05, random_state=seed, n_jobs=-1
+        )
+        model.fit(X_train)
 
-    m = {
-        "auc": roc_auc_score(y_test, scores),
-        "precision": precision_score(y_test, y_pred, zero_division=0),
-        "recall": recall_score(y_test, y_pred, zero_division=0),
-        "f1": f1_score(y_test, y_pred, zero_division=0),
-    }
-    seed_metrics.append(m)
-    seed_workloads.append(compute_workload_at_recall(y_test, scores))
+        scores = -model.decision_function(X_ev)  # higher = more anomalous
+        y_pred = (model.predict(X_ev) == -1).astype(int)  # 1 = anomaly = attack
+
+        m = {
+            "auc": roc_auc_score(y_ev, scores),
+            "precision": precision_score(y_ev, y_pred, zero_division=0),
+            "recall": recall_score(y_ev, y_pred, zero_division=0),
+            "f1": f1_score(y_ev, y_pred, zero_division=0),
+        }
+        seed_metrics.append(m)
+        seed_workloads.append(compute_workload_at_recall(y_ev, scores))
+        print(
+            f"  [{ek}] seed={seed}: AUC={m['auc']:.3f} P={m['precision']:.3f} "
+            f"R={m['recall']:.3f} F1={m['f1']:.3f}"
+        )
+
+    workload = average_workload_at_recall(seed_workloads)
+    avg = pd.DataFrame(seed_metrics).mean()
+    print(f"\n=== cscas_anomaly_iforest [{SCHEMA} / {ek}] (mean of 5 seeds) ===")
     print(
-        f"  seed={seed}: AUC={m['auc']:.3f} P={m['precision']:.3f} "
-        f"R={m['recall']:.3f} F1={m['f1']:.3f}"
+        f"AUC={avg.auc:.3f} P={avg.precision:.3f} R={avg.recall:.3f} F1={avg.f1:.3f}  (default cut)"
     )
+    if workload.get("0.90"):
+        w = workload["0.90"]
+        print(
+            f"  @recall>=0.90: P={w['precision']:.3f} FP={w['fp']:.0f} "
+            f"workload_reduction={w['workload_reduction']:.3f}"
+        )
 
-workload = average_workload_at_recall(seed_workloads)
-
-avg = pd.DataFrame(seed_metrics).mean()
-print("\n=== cscas_anomaly_iforest (mean of 5 seeds) ===")
-print(
-    f"AUC={avg.auc:.3f} P={avg.precision:.3f} R={avg.recall:.3f} F1={avg.f1:.3f}  (default cut)"
-)
-if workload.get("0.90"):
-    w = workload["0.90"]
-    print(
-        f"  @recall>=0.90: P={w['precision']:.3f} FP={w['fp']:.0f} "
-        f"workload_reduction={w['workload_reduction']:.3f}"
+    save_anomaly_results(
+        name=result_name("cscas_anomaly_iforest", SCHEMA, ek),
+        description=(
+            "IsolationForest(n_estimators=100, contamination=0.05) fit on "
+            f"benign-only rows of the {schema_blurb(SCHEMA, len(FEATURE_COLS))}, "
+            "evaluated on the "
+            f"{'shared 20k eval subsample' if ek == 'subsample' else 'full 1.26M-row test set'}. "
+            "No attack rows used in training. Mean over 5 seeds "
+            "(random_state=0..4). precision/recall/f1 at the default "
+            "contamination=0.05 cut; workload_at_recall is the tuned-threshold "
+            "view (seed-averaged)."
+        ),
+        seeds=seed_metrics,
+        workload=workload,
     )
-
-save_anomaly_results(
-    name="cscas_anomaly_iforest",
-    description=(
-        "IsolationForest(n_estimators=100, contamination=0.05) fit on "
-        "benign-only rows of this project's reduced base schema (5 "
-        "features -- SignatureID, SCAS, and all Similarity columns "
-        "removed, same as cscas_base.py), evaluated on the shared eval "
-        "subsample. No attack rows used in training -- second anomaly-"
-        "detector model family alongside cscas_anomaly.py's OneClassSVM. "
-        "Mean over 5 seeds (random_state=0..4). precision/recall/f1 at the "
-        "default contamination=0.05 cut; workload_at_recall is the tuned-"
-        "threshold view (seed-averaged)."
-    ),
-    seeds=seed_metrics,
-    workload=workload,
-)

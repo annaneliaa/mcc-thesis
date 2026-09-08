@@ -37,7 +37,8 @@ import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import precision_score, recall_score, f1_score
 
-from thesis.baselines._results import save_baseline_results
+from thesis.baselines._cscas_schema import force_recompute
+from thesis.baselines._results import results_exist, save_baseline_results
 from thesis.baselines._sampling import (
     class_weighted_pool,
     get_cscas_eval_subsample,
@@ -91,6 +92,14 @@ assert len(FEATURE_COLS) == 5, f"got {len(FEATURE_COLS)}"
 print(f"Feature count: {len(FEATURE_COLS)}")
 print(FEATURE_COLS)
 
+if not force_recompute() and all(
+    results_exist(n) for n in ("cscas_base", "cscas_base_fulltest")
+):
+    print(
+        "[skip] cscas_base + cscas_base_fulltest already exist (CSCAS_FORCE=1 to re-run)."
+    )
+    raise SystemExit(0)
+
 # 5) Verify training pools against Table IV (pool construction itself now
 # lives in _sampling.py -- these are just the sanity-check counts).
 important = train[train["Label"] == 1]
@@ -101,13 +110,20 @@ assert len(important) == 1_765, f"got {len(important)}"
 assert len(irr_inliers) == 133_614, f"got {len(irr_inliers)}"
 assert len(irr_outliers) == 4_153, f"got {len(irr_outliers)}"
 
-# 6) Prepare eval set -- shared, frozen subsample (not the full test set --
-# that's reserved for the paper-replication script only).
+# 6) Prepare eval sets. Primary: the shared, frozen 20k subsample (the grid
+# every non-replication baseline lives in). We ALSO score every fitted model
+# on the FULL 1.26M-row test set (same fitted models, a second .predict())
+# so the reduced 5-feature schema has a cell in the paper's own full-test
+# protocol -> results/cscas_base_fulltest.json. results/cscas_base.json is
+# unchanged.
 eval_df = get_cscas_eval_subsample(test)
 X_test = eval_df[FEATURE_COLS].values
 y_test = eval_df["Label"].values
+X_full = test[FEATURE_COLS].values
+y_full = test["Label"].values
 print(
     f"Evaluating on shared eval subsample: {len(eval_df)} rows, {int(eval_df['Label'].sum())} positive"
+    f"  (+ full test set: {len(test)} rows, {int(test['Label'].sum())} positive)"
 )
 
 # 7) Three training-pool conditions
@@ -124,6 +140,16 @@ REFERENCE = {
 }
 
 results: dict[str, list[dict[str, float]]] = {name: [] for name in POOL_BUILDERS}
+results_full: dict[str, list[dict[str, float]]] = {name: [] for name in POOL_BUILDERS}
+
+
+def _metrics(y_true, y_pred) -> dict[str, float]:
+    return {
+        "precision": precision_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred),
+        "f1": f1_score(y_true, y_pred),
+    }
+
 
 for condition, build_pool in POOL_BUILDERS.items():
     reference = REFERENCE[condition]
@@ -146,16 +172,20 @@ for condition, build_pool in POOL_BUILDERS.items():
             class_weight=extra_kwargs.get("class_weight"),
         )
         clf.fit(X_tr, y_tr)
-        y_pred = clf.predict(X_test)
 
-        p = precision_score(y_test, y_pred)
-        r = recall_score(y_test, y_pred)
-        f = f1_score(y_test, y_pred)
-        results[condition].append({"precision": p, "recall": r, "f1": f})
-        print(f"  seed={seed}: P={p:.3f} R={r:.3f} F1={f:.3f}")
+        m_sub = _metrics(y_test, clf.predict(X_test))
+        m_full = _metrics(y_full, clf.predict(X_full))
+        results[condition].append(m_sub)
+        results_full[condition].append(m_full)
+        print(
+            f"  seed={seed}: subsample  P={m_sub['precision']:.3f} R={m_sub['recall']:.3f} F1={m_sub['f1']:.3f}"
+            f"   |  full test  P={m_full['precision']:.3f} R={m_full['recall']:.3f} F1={m_full['f1']:.3f}"
+        )
 
     avg = pd.DataFrame(results[condition]).mean()
-    print(f"  AVERAGE: P={avg.precision:.3f} R={avg.recall:.3f} F1={avg.f1:.3f}")
+    print(
+        f"  AVERAGE (subsample): P={avg.precision:.3f} R={avg.recall:.3f} F1={avg.f1:.3f}"
+    )
 
 
 print(
@@ -179,4 +209,14 @@ save_baseline_results(
         "RandomForestClassifier(n_estimators=100), evaluated on the shared eval subsample"
     ),
     results=results,
+)
+save_baseline_results(
+    name="cscas_base_fulltest",
+    description=(
+        "This project's reduced base schema (5 features), "
+        "RandomForestClassifier(n_estimators=100), scored on the FULL 1.26M-row "
+        "test set (the CSCAS paper's own protocol -- same fitted models as "
+        "cscas_base.json; this is the 5-feature / full-test cell of the grid)"
+    ),
+    results=results_full,
 )

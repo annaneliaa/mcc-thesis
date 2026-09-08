@@ -36,6 +36,12 @@ Usage:
   # Override with a hand-built shortlist CSV
   python src/thesis/scripts/system_eval/run_temporal_decay.py cscas \\
       --shortlist my_shortlist.csv
+
+  # Anchor W_src to the CSCAS baseline's train/test split so the decay curve
+  # lines up with the baseline experiment's aggregate score (metrics only)
+  python src/thesis/scripts/system_eval/run_temporal_decay.py cscas \\
+      --granularities 0.1 0.25 0.5 --models logreg xgboost iforest ocsvm \\
+      --source-split-mode baseline_split --no-explanations
 """
 
 from __future__ import annotations
@@ -61,6 +67,12 @@ sys.path.insert(0, str(_REPO / "src"))
 _DEFAULT_MINING_SETTINGS = (
     _REPO / "src" / "thesis" / "configs" / "screening_mining_settings.yaml"
 )
+
+# The CSCAS baseline's chronological train/test boundary -- mirrors
+# baselines/cscas_base.py's split_time. Used as the default
+# --source-split-time when --source-split-mode baseline_split is requested
+# for cscas without an explicit instant.
+_CSCAS_BASELINE_SPLIT_TIME = "2022-01-26 06:23:21+02:00"
 
 
 def main() -> None:
@@ -113,6 +125,32 @@ def main() -> None:
         dest="train_frac",
         metavar="FRAC",
         help="W_src (window 0) internal train/test split fraction. Default: 0.7",
+    )
+    parser.add_argument(
+        "--source-split-mode",
+        choices=["window0", "baseline_split"],
+        default="window0",
+        dest="source_split_mode",
+        help=(
+            "What the source window W_src is. 'window0' (default): window 0 at "
+            "each config's granularity, walk over windows 1..n-1 of the whole "
+            "timeline. 'baseline_split': W_src = every alert_group at or before "
+            "--source-split-time (the CSCAS baseline's own train/test boundary), "
+            "walk carves the post-split remainder (the baseline's test period) "
+            "into windows -- so the decay curve lines up with the baseline's "
+            "aggregate score. CSCAS only."
+        ),
+    )
+    parser.add_argument(
+        "--source-split-time",
+        default=None,
+        dest="source_split_time",
+        metavar="ISO8601",
+        help=(
+            "Train/test boundary instant for --source-split-mode baseline_split "
+            f"(e.g. '{_CSCAS_BASELINE_SPLIT_TIME}'). Defaults to the CSCAS "
+            "baseline's split_time when the scenario is cscas."
+        ),
     )
     parser.add_argument(
         "--threshold-mode",
@@ -218,6 +256,16 @@ def main() -> None:
 
     scenario = args.scenario
     is_cscas = dataset_for_scenario(scenario) == "cscas"
+
+    source_split_time = args.source_split_time
+    if args.source_split_mode == "baseline_split":
+        if source_split_time is None and is_cscas:
+            source_split_time = _CSCAS_BASELINE_SPLIT_TIME
+        if source_split_time is None:
+            parser.error(
+                "--source-split-mode baseline_split needs --source-split-time "
+                "(no baseline boundary is known for a non-cscas scenario)"
+            )
     grouping = (
         GroupingConfig(mode=CSCAS_PREGROUPED_METHOD)
         if is_cscas
@@ -240,6 +288,8 @@ def main() -> None:
         scenario=scenario,
         shortlist_path=shortlist_path,
         train_frac_within_window=args.train_frac,
+        source_split_mode=args.source_split_mode,
+        source_split_time=source_split_time,
         mining_settings_path=args.mining_settings,
         threshold_mode=args.threshold_mode,
         calibrated_recall_target=args.calibrated_recall_target,

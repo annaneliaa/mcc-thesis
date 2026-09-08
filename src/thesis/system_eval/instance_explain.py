@@ -132,7 +132,7 @@ def explain_instances_for_config(
         X_h, y_h = fit.X_test, fit.y_test
     elif horizon_window_index < fit.n_windows:
         X_h, y_h, _ = encode_target_window(
-            alert_groups, n_total, fit.gran, horizon_window_index, fit.schema
+            alert_groups, fit.scheme, fit.gran, horizon_window_index, fit.schema
         )
     else:
         raise ValueError(
