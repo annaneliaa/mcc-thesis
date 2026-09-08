@@ -144,13 +144,25 @@ class ScreeningSweepConfig:
 class TemporalDecayConfig:
     """Experiment 2 (Temporal Generalization / Fixed-Horizon Decay): for each
     shortlisted (feature_set, mining_setting, granularity, model) config,
-    mine a schema and fit a model once on window 0's train split (W_src is
-    always the first window -- no other source-window roles), freeze
-    schema/model/threshold, then walk forward one window at a time to the
-    end of the timeline, evaluating the frozen model on each window in turn
-    (h=0 is W_src's own held-out test split; h=1..n_windows-1 are fully
-    external windows). SHAP + LIME importances are tracked at every horizon
-    step so feature-attribution drift is visible alongside the metric decay.
+    mine a schema and fit a model once on the source window's train split,
+    freeze schema/model/threshold, then walk forward one window at a time,
+    evaluating the frozen model on each window in turn (h=0 is the source
+    window's own held-out test split; h>=1 are fully external windows). SHAP
+    + LIME importances are tracked at every horizon step so
+    feature-attribution drift is visible alongside the metric decay.
+
+    `source_split_mode` picks what the source window (W_src) is:
+      * "window0" (default): W_src = window 0 of compute_window_bounds at the
+        config's granularity; the walk covers windows 1..n_windows-1 of the
+        full timeline.
+      * "baseline_split": W_src = every alert_group at or before
+        `source_split_time` (the CSCAS baseline's own chronological
+        train/test boundary -- see baselines/cscas_base.py); the walk carves
+        the post-split_time remainder (the baseline's test period) into
+        windows at the config's granularity, so the decay curve lines up
+        one-to-one with the single aggregate number the baseline reports on
+        that same test set.
+
     See experiments/temporal_decay.py."""
 
     scenario: str
@@ -158,6 +170,13 @@ class TemporalDecayConfig:
     # W_src's internal train/test split -- mining + fitting only ever see the
     # train side; h=0 is scored on the held-out test side.
     train_frac_within_window: float = 0.7
+    # What the source window is (see the class docstring). "baseline_split"
+    # requires source_split_time and is only meaningful for CSCAS.
+    source_split_mode: Literal["window0", "baseline_split"] = "window0"
+    # ISO8601 instant of the baseline's train/test boundary, used only when
+    # source_split_mode == "baseline_split" (e.g. "2022-01-26 06:23:21+02:00"
+    # for CSCAS, mirroring baselines/cscas_base.py's split_time).
+    source_split_time: str | None = None
     mining_settings_path: Path = field(
         default_factory=lambda: Path(
             "src/thesis/configs/screening_mining_settings.yaml"
@@ -198,6 +217,13 @@ class TemporalDecayConfig:
     # every process). Kept modest by default to avoid oversubscribing cores
     # against BLAS's own internal threading within each fit.
     n_jobs: int = 4
+
+    def __post_init__(self) -> None:
+        if self.source_split_mode == "baseline_split" and not self.source_split_time:
+            raise ValueError(
+                "source_split_mode='baseline_split' requires source_split_time "
+                "(ISO8601, e.g. the CSCAS baseline's '2022-01-26 06:23:21+02:00')"
+            )
 
 
 @dataclass

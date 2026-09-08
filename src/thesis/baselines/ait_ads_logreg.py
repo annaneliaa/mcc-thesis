@@ -4,7 +4,7 @@ Same experimental setup as ait_ads_rf.py (data loading, split, per-
 RandomForestClassifier for LogisticRegression, matching cscas_logreg.py's
 relationship to cscas_base.py.
 
-Unlike cscas_logreg.py, no missingness-flag handling is needed here: CSCAS's
+Unlike cscas_logreg.py, no `-1`-sentinel imputation is needed here: CSCAS's
 base schema has a `-1` "not applicable" sentinel in 3 of its 5 columns (see
 cscas_logreg.py's module docstring); AIT-ADS's base schema
 (hour_of_day/n_alerts/n_sigs/n_hosts/n_shorts, from

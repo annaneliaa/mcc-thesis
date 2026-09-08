@@ -256,6 +256,87 @@ def get_or_mine_window_attribute_schema(
     )
 
 
+def get_or_mine_slice_attribute_schema(
+    scenario: str,
+    alert_groups: list[AlertGroup],
+    alert_groups_path: Path,
+    slice_start: int,
+    slice_end: int,
+    slice_tag: str,
+    attribute_mining_config: AttributeMiningConfig,
+    root_dir: Path = FEATURE_DIR,
+    force: bool = False,
+) -> WindowSchemaResult:
+    """Mine (or reuse a cached) attribute schema from an explicit
+    chronological slice ``alert_groups[slice_start:slice_end]``, identified
+    by a caller-chosen stable ``slice_tag`` rather than a (gran, win_idx)
+    pair.
+
+    For source windows that aren't one of compute_window_bounds' windows --
+    e.g. temporal_decay.py's "baseline_split" mode, where W_src's train
+    split is the CSCAS baseline's entire pre-split_time train period, not a
+    fraction of one granularity window. The cache identity uses (gran=-1,
+    win_idx=-1, slice bounds, tag) so these entries never collide with the
+    windowed ones. win_start/win_end/win_train_end in the result all take
+    the slice bounds (win_train_end == slice_end -- no further held-out
+    split here; the caller already carved this slice as its train side).
+    """
+    identity = _window_slice_identity(
+        alert_groups_path,
+        gran=-1.0,
+        win_idx=-1,
+        slice_start=slice_start,
+        slice_end=slice_end,
+        tag=slice_tag,
+    )
+    fingerprint = compute_fingerprint_from_identity(identity, attribute_mining_config)
+
+    cached_schema_path = (
+        None if force else lookup_cached_schema(scenario, fingerprint, root_dir)
+    )
+    if cached_schema_path is not None:
+        return WindowSchemaResult(
+            schema_path=cached_schema_path,
+            mining_run_dir=None,
+            mining_stats={"cache_hit": True, "fingerprint": fingerprint},
+            win_start=slice_start,
+            win_end=slice_end,
+            win_train_end=slice_end,
+            cache_hit=True,
+        )
+
+    slice_path = _resolve_window_slice_alert_groups_path(
+        alert_groups,
+        alert_groups_path,
+        gran=-1.0,
+        win_idx=-1,
+        slice_start=slice_start,
+        slice_end=slice_end,
+        tag=slice_tag,
+    )
+
+    run_name = f"temporal_decay_{scenario}_{slice_tag}"
+    schema_path, mining_run_dir, mining_stats = _mine_and_discard_slice(
+        scenario=scenario,
+        slice_path=slice_path,
+        run_name=run_name,
+        attribute_mining_config=attribute_mining_config,
+        root_dir=root_dir,
+        force=force,
+        fingerprint=fingerprint,
+    )
+
+    return WindowSchemaResult(
+        schema_path=schema_path,
+        mining_run_dir=mining_run_dir,
+        mining_stats=mining_stats,
+        win_start=slice_start,
+        win_end=slice_end,
+        win_train_end=slice_end,
+        cache_hit=bool(mining_stats.get("cache_hit")),
+    )
+
+
 def get_or_mine_full_window_attribute_schema(
     scenario: str,
     alert_groups: list[AlertGroup],

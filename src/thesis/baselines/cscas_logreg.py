@@ -5,28 +5,19 @@ for LogisticRegression, the "standard interpretable linear floor" in the
 project's baseline design (see Docs/Baselines.md).
 
 Unlike RF/XGBoost, LogisticRegression is NOT scale-invariant, so this
-script needs two things neither of the tree-based scripts does:
+script's sklearn Pipeline does two things the tree-based scripts don't,
+both fit on each seed's training pool only (never on an eval set -- that
+would leak eval statistics into training):
 
-  1. StandardScaler, fit on each seed's training pool only (never on the
-     eval subsample -- that would leak eval statistics into training) and
-     then applied to both that pool and the eval subsample.
+  1. sentinel_imputer() -- SimpleImputer(strategy="median",
+     missing_values=-1). CSCAS's `-1` "not applicable" sentinel (ExtPort is
+     -1 for a portless protocol; a *Similarity column is -1 for an
+     attribute that protocol never populates) would otherwise sit far below
+     the real value range and skew StandardScaler's fitted mean/std. Median
+     imputation replaces it with a typical applicable value. (RF/XGBoost
+     don't need this -- a tree split just treats -1 as a low value.)
 
-  2. A decision on how to treat CSCAS's `-1` "not applicable" sentinel.
-     It appears in 3 of the reduced base schema's 5 feature columns (Proto,
-     ExtPort, IntPort -- e.g. ExtPort is -1 whenever a protocol has no
-     notion of a port). Scaling -1 in place would conflate "structurally
-     not applicable" with "very dissimilar" on the same continuous axis,
-     which distorts StandardScaler's fitted mean/std for columns where -1
-     is a sizable share of rows (RF/XGBoost don't have this problem -- tree
-     splits just treat -1 as a very low value, no distortion). Decision: add one binary
-     `{col}_missing` indicator column per sentinel-bearing column,
-     impute the sentinel to 0 in the original column, then scale
-     everything (imputed values + flags) together. This lets the linear
-     model separate "this alert type never has this field" (the flag)
-     from the actual similarity signal on rows where it IS applicable.
-     Which columns carry the sentinel is determined once from the full
-     training set (not per-pool), so the augmented feature schema is
-     fixed across every seed/condition and matches the eval subsample.
+  2. StandardScaler.
 
 Run:
     cd src/thesis/baselines
@@ -42,6 +33,15 @@ from sklearn.metrics import precision_score, recall_score, f1_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from thesis.baselines._cscas_schema import (
+    SCHEMAS_CLASSIFIER,
+    active_schema,
+    cscas_feature_cols,
+    grid_outputs_done,
+    result_name,
+    schema_blurb,
+    sentinel_imputer,
+)
 from thesis.baselines._results import save_baseline_results
 from thesis.baselines._sampling import (
     class_weighted_pool,
@@ -53,8 +53,6 @@ from thesis.baselines._sampling import (
 # LogisticRegression here is CPU-only -- no GPU/device selection in this
 # script -- printed for parity with the torch-based baselines' device line.
 print("Using device: cpu")
-
-SENTINEL_VALUE = -1
 
 # 1) Load and sort dataset
 
@@ -78,45 +76,18 @@ assert len(test) == 1_255_792, f"got {len(test)}"
 assert train["Label"].sum() == 1_765, f"got {train['Label'].sum()}"
 assert test["Label"].sum() == 19_187, f"got {test['Label'].sum()}"
 
-# 4) Reduced base schema -- same 5 columns as cscas_base.py (see that
-# module's docstring for what's dropped and why: SignatureID, SCAS, and
-# every *Similarity column, all unrealistic for a real deployment).
-DROP_COLS = [
-    "Timestamp",
-    "SignatureText",
-    "Label",
-    "ExtIP",
-    "IntIP",
-    "SignatureID",
-    "SCAS",
-]
-FEATURE_COLS = [
-    c for c in df.columns if c not in DROP_COLS and not c.endswith("Similarity")
-]
-assert len(FEATURE_COLS) == 5, f"got {len(FEATURE_COLS)}"
-print(f"Feature count: {len(FEATURE_COLS)}")
+# 4) Feature schema -- CSCAS_SCHEMA env var picks "base" (5 cols, same as
+# cscas_base.py) or "full" (the paper's 42). See _cscas_schema.py.
+SCHEMA = active_schema(SCHEMAS_CLASSIFIER)
+FEATURE_COLS = cscas_feature_cols(df, schema=SCHEMA)
+print(f"Schema: {SCHEMA} -- {len(FEATURE_COLS)} raw feature columns")
 print(FEATURE_COLS)
 
-# 4b) Columns carrying the -1 sentinel, determined once from the full
-# training set -- see module docstring.
-SENTINEL_COLS = [c for c in FEATURE_COLS if (train[c] == SENTINEL_VALUE).any()]
-print(f"Columns with -1 sentinel in train: {len(SENTINEL_COLS)} of {len(FEATURE_COLS)}")
-
-MODEL_FEATURE_COLS = FEATURE_COLS + [f"{c}_missing" for c in SENTINEL_COLS]
-
-
-def add_missingness_flags(frame: pd.DataFrame) -> pd.DataFrame:
-    """Add a {col}_missing indicator per SENTINEL_COLS column and impute
-    the sentinel to 0 in place. Deterministic elementwise transform (no
-    statistics learned from data), so safe to apply identically to every
-    pool and the eval subsample with no leakage risk."""
-    frame = frame.copy()
-    for col in SENTINEL_COLS:
-        is_missing = frame[col] == SENTINEL_VALUE
-        frame[f"{col}_missing"] = is_missing.astype(int)
-        frame.loc[is_missing, col] = 0.0
-    return frame
-
+if grid_outputs_done(["cscas_logreg"], SCHEMA):
+    print(
+        f"[skip] cscas_logreg {SCHEMA} outputs already exist (CSCAS_FORCE=1 to re-run)."
+    )
+    raise SystemExit(0)
 
 # 5) Verify training pools against Table IV (pool construction itself
 # lives in _sampling.py -- these are just the sanity-check counts).
@@ -128,13 +99,19 @@ assert len(important) == 1_765, f"got {len(important)}"
 assert len(irr_inliers) == 133_614, f"got {len(irr_inliers)}"
 assert len(irr_outliers) == 4_153, f"got {len(irr_outliers)}"
 
-# 6) Prepare eval set -- shared, frozen subsample, missingness flags
-# applied once outside the seed loop (deterministic transform).
-eval_df = add_missingness_flags(get_cscas_eval_subsample(test))
-X_test = eval_df[MODEL_FEATURE_COLS].values
-y_test = eval_df["Label"].values
+# 6) Prepare eval sets -- both cells of the test-set axis. The -1 sentinel is
+# handled inside each seed's Pipeline (sentinel_imputer, fit on the pool
+# only), so the raw FEATURE_COLS go through here untouched.
+#   subsample: shared, frozen 20k -- the grid every baseline lives in.
+#   fulltest:  all 1.26M test rows -- the CSCAS paper's own protocol.
+_eval_sub = get_cscas_eval_subsample(test)
+EVAL_SETS = {
+    "subsample": (_eval_sub[FEATURE_COLS].values, _eval_sub["Label"].values),
+    "fulltest": (test[FEATURE_COLS].values, test["Label"].values),
+}
 print(
-    f"Evaluating on shared eval subsample: {len(eval_df)} rows, {int(eval_df['Label'].sum())} positive"
+    f"Evaluating on: subsample ({len(_eval_sub)} rows, {int(_eval_sub['Label'].sum())} pos)"
+    f"  +  full test ({len(test)} rows, {int(test['Label'].sum())} pos)"
 )
 
 # 7) Three training-pool conditions
@@ -150,13 +127,14 @@ REFERENCE = {
     "guided": "P=0.868, R=0.952, F1=0.908",
 }
 
-results: dict[str, list[dict[str, float]]] = {name: [] for name in POOL_BUILDERS}
+# results[eval_set][condition] -> list of per-seed metric dicts
+results: dict[str, dict[str, list[dict[str, float]]]] = {
+    ek: {name: [] for name in POOL_BUILDERS} for ek in EVAL_SETS
+}
 
 for condition, build_pool in POOL_BUILDERS.items():
     reference = REFERENCE[condition]
-    print(
-        f"\n=== {condition} (LogisticRegression, reduced base schema + missingness flags) ==="
-    )
+    print(f"\n=== {condition} (LogisticRegression, {SCHEMA} schema) ===")
     if reference:
         print(
             f"    Paper reference (RF, 42 numeric features, full test set): {reference}"
@@ -164,13 +142,13 @@ for condition, build_pool in POOL_BUILDERS.items():
 
     for seed in range(5):
         pool, extra_kwargs = build_pool(seed)
-        pool_enc = add_missingness_flags(pool)
 
-        X_tr = pool_enc[MODEL_FEATURE_COLS].values
-        y_tr = pool_enc["Label"].values
+        X_tr = pool[FEATURE_COLS].values
+        y_tr = pool["Label"].values
 
         clf = Pipeline(
             [
+                ("impute", sentinel_imputer()),
                 ("scaler", StandardScaler()),
                 (
                     "clf",
@@ -183,38 +161,33 @@ for condition, build_pool in POOL_BUILDERS.items():
             ]
         )
         clf.fit(X_tr, y_tr)
-        y_pred = clf.predict(X_test)
 
-        p = precision_score(y_test, y_pred)
-        r = recall_score(y_test, y_pred)
-        f = f1_score(y_test, y_pred)
-        results[condition].append({"precision": p, "recall": r, "f1": f})
-        print(f"  seed={seed}: P={p:.3f} R={r:.3f} F1={f:.3f}")
+        row = []
+        for ek, (X_ev, y_ev) in EVAL_SETS.items():
+            y_pred = clf.predict(X_ev)
+            m = {
+                "precision": precision_score(y_ev, y_pred),
+                "recall": recall_score(y_ev, y_pred),
+                "f1": f1_score(y_ev, y_pred),
+            }
+            results[ek][condition].append(m)
+            row.append(f"{ek} F1={m['f1']:.3f}")
+        print(f"  seed={seed}: " + "  |  ".join(row))
 
-    avg = pd.DataFrame(results[condition]).mean()
-    print(f"  AVERAGE: P={avg.precision:.3f} R={avg.recall:.3f} F1={avg.f1:.3f}")
+    for ek in EVAL_SETS:
+        avg = pd.DataFrame(results[ek][condition]).mean()
+        print(
+            f"  AVERAGE [{ek}]: P={avg.precision:.3f} R={avg.recall:.3f} F1={avg.f1:.3f}"
+        )
 
 
-print(
-    "\n=== Summary: paper (RF, 42 features, full test set) vs "
-    "LogReg (reduced base schema + missingness flags, shared eval subsample) ==="
-)
-for condition, reference in REFERENCE.items():
-    avg = pd.DataFrame(results[condition]).mean()
-    ref_str = f"paper {reference}  |  " if reference else ""
-    print(
-        f"{condition:<16}"
-        f"{ref_str}"
-        f"mine P={avg.precision:.3f} R={avg.recall:.3f} F1={avg.f1:.3f}"
+for ek in EVAL_SETS:
+    save_baseline_results(
+        name=result_name("cscas_logreg", SCHEMA, ek),
+        description=(
+            f"{schema_blurb(SCHEMA, len(FEATURE_COLS))}, median-imputed -1 "
+            "sentinel + StandardScaler, LogisticRegression, evaluated on the "
+            f"{'shared 20k eval subsample' if ek == 'subsample' else 'full 1.26M-row test set'}"
+        ),
+        results=results[ek],
     )
-
-save_baseline_results(
-    name="cscas_logreg",
-    description=(
-        "Reduced base schema (5 features -- SignatureID, SCAS, and all "
-        "Similarity columns removed as unrealistic for a real deployment -- "
-        "plus missingness flags for -1 sentinel columns), StandardScaler, "
-        "LogisticRegression, evaluated on the shared eval subsample"
-    ),
-    results=results,
-)

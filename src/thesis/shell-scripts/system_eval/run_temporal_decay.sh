@@ -6,11 +6,11 @@
 # GRANULARITIES below, plus a baseline row per granularity. That YAML is the
 # single input: no feasible-config CSV, no notebook export step, no
 # real-evaluation ranking. Edit the YAML to change what runs. For each
-# resulting config, run_temporal_decay.py mines/fits once on window 0's
-# train split and walks the frozen schema/model/threshold forward one window
-# at a time to the end of the timeline, tracking SHAP/LIME importances
-# alongside the metric decay -- mined schemas are cached, so rerunning this
-# script only (re)mines whatever isn't already cached.
+# resulting config, run_temporal_decay.py mines/fits once on the source
+# window's train split (see SOURCE_SPLIT_MODE below) and walks the frozen
+# schema/model/threshold forward one window at a time, tracking SHAP/LIME
+# importances alongside the metric decay -- mined schemas are cached, so
+# rerunning this script only (re)mines whatever isn't already cached.
 #
 # Usage:
 #   src/thesis/shell-scripts/system_eval/run_temporal_decay.sh
@@ -41,11 +41,22 @@ GRANULARITIES=(0.1 0.25 0.5)  # keep to the mining grid's MINE_FRACS so every gr
 MODELS=(logreg xgboost iforest ocsvm)
 THRESHOLD_MODE="fixed"  # or "calibrated_recall"
 CALIBRATED_RECALL_TARGET="0.90"  # only used when THRESHOLD_MODE=calibrated_recall
+# Source window W_src:
+#   window0        -- window 0 at each config's granularity; walk over
+#                     windows 1..n-1 of the whole timeline.
+#   baseline_split -- W_src = every alert_group at or before the CSCAS
+#                     baseline's split_time (baselines/cscas_base.py); the
+#                     walk carves the post-split remainder (the baseline's
+#                     own test period) into windows, so the decay curve
+#                     lines up one-to-one with the aggregate score the
+#                     baseline reports on that same test set. CSCAS only;
+#                     --source-split-time defaults to the CSCAS boundary.
+SOURCE_SPLIT_MODE="baseline_split"  # or "window0"
 # SHAP/LIME per horizon is cheap for logreg (LinearExplainer) and xgboost
 # (TreeExplainer) but slow for iforest/ocsvm (no analytic explainer -- SHAP
 # falls back to PermutationExplainer over ~325 features). Drop EXPLAIN_SAMPLE_N
 # or set COMPUTE_EXPLANATIONS=0 for a faster first pass.
-COMPUTE_EXPLANATIONS=1  # 0 to skip SHAP/LIME (metrics only, much faster)
+COMPUTE_EXPLANATIONS=0  # 0 to skip SHAP/LIME (metrics only, much faster)
 EXPLAIN_SAMPLE_N=50
 LIME_NUM_SAMPLES=1000
 
@@ -83,6 +94,7 @@ for scenario in "${SCENARIOS[@]}"; do
     --granularities "${GRANULARITIES[@]}" \
     --models "${MODELS[@]}" \
     --threshold-mode "$THRESHOLD_MODE" \
+    --source-split-mode "$SOURCE_SPLIT_MODE" \
     --explain-sample-n "$EXPLAIN_SAMPLE_N" \
     --lime-num-samples "$LIME_NUM_SAMPLES")
   if [[ "$THRESHOLD_MODE" == "calibrated_recall" ]]; then

@@ -34,15 +34,28 @@ LOG_DIR="$BASELINES_DIR/logs"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/cscas_mining_$(date +%Y%m%d_%H%M%S).log"
 
+export CSCAS_FORCE="${CSCAS_FORCE:-0}"
+
 {
     echo "=== CSCAS mining-classifier baseline run started at $(date) ==="
-    echo "CSCAS_FORCE=${CSCAS_FORCE:-0}"
+    echo "CSCAS_FORCE=$CSCAS_FORCE"
 
-    start=$(date +%s)
-    "$PYTHON" cscas_mining.py
-    status=$?
-    end=$(date +%s)
+    # Both feature schemas: base (5 cols) and full (the paper's 42). Each run
+    # sweeps both eval sets internally (subsample + full test) and is
+    # resumable -- cscas_mining.py exits before the mining pass when all its
+    # result files for that schema already exist (CSCAS_FORCE=1 overrides).
+    overall_start=$(date +%s)
+    for schema in base full; do
+        echo ""
+        echo "--- CSCAS_SCHEMA=$schema started at $(date) ---"
+        start=$(date +%s)
+        env CSCAS_SCHEMA="$schema" "$PYTHON" cscas_mining.py
+        status=$?
+        end=$(date +%s)
+        echo "--- CSCAS_SCHEMA=$schema finished (exit=$status, $((end - start))s) ---"
+    done
+    overall_end=$(date +%s)
 
     echo ""
-    echo "=== CSCAS mining-classifier baseline run finished at $(date) (exit=$status, $((end - start))s) ==="
+    echo "=== CSCAS mining-classifier baseline run finished at $(date) ($((overall_end - overall_start))s) ==="
 } 2>&1 | tee "$LOG_FILE"

@@ -8,8 +8,8 @@ thesis.mining.attribute_mining_job) on the SAME train split.
 The mined matrix is then fit with all three tabular classifiers -- the
 mining counterparts of cscas_base.py / cscas_logreg.py / cscas_xgboost.py --
 saved as `cscas_mining` (RF, name unchanged), `cscas_mining_logreg` and
-`cscas_mining_xgboost`. LogReg gets the same -1-sentinel missingness-flag +
-StandardScaler treatment cscas_logreg.py applies (the mined symbolic columns
+`cscas_mining_xgboost`. LogReg gets the same median-impute-of-the--1-sentinel
++ StandardScaler Pipeline cscas_logreg.py applies (the mined symbolic columns
 are binary indicators and pass through unchanged for every model). Each
 result is skipped if its JSON already exists (set CSCAS_FORCE=1 to
 recompute); the single attribute-mining pass still runs on every invocation,
@@ -51,6 +51,15 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
+from thesis.baselines._cscas_schema import (
+    SCHEMAS_CLASSIFIER,
+    active_schema,
+    cscas_feature_cols,
+    grid_outputs_done,
+    result_name,
+    schema_blurb,
+    sentinel_imputer,
+)
 from thesis.baselines._results import results_exist, save_baseline_results
 from thesis.baselines._sampling import (
     class_weighted_pool,
@@ -97,51 +106,26 @@ assert test["Label"].sum() == 19_187, f"got {test['Label'].sum()}"
 # symbolic_train_df.iloc[pool.index]) depends on this invariant holding.
 assert list(train.index) == list(range(len(train)))
 
-# 4) Define feature columns -- same reduced base schema as cscas_base.py.
-DROP_COLS = [
-    "Timestamp",
-    "SignatureText",
-    "Label",
-    "ExtIP",
-    "IntIP",
-    "SignatureID",
-    "SCAS",
-]
-FEATURE_COLS = [
-    c for c in df.columns if c not in DROP_COLS and not c.endswith("Similarity")
-]
-assert len(FEATURE_COLS) == 5, f"got {len(FEATURE_COLS)}"
-print(f"Base feature count: {len(FEATURE_COLS)}")
+# 4) Base feature schema -- CSCAS_SCHEMA env var picks "base" (5 cols) or
+# "full" (the paper's 42). The mined symbolic features are added on top of
+# whichever is active. See _cscas_schema.py.
+SCHEMA = active_schema(SCHEMAS_CLASSIFIER)
+FEATURE_COLS = cscas_feature_cols(df, schema=SCHEMA)
+print(
+    f"Base schema: {SCHEMA} -- {len(FEATURE_COLS)} feature columns (+ mined symbolic)"
+)
 print(FEATURE_COLS)
 
-# 4b) LogisticRegression-only prep (RF/XGBoost ignore all of this -- tree
-# splits treat -1 as a low value). The -1 "not applicable" sentinel in
-# Proto/ExtPort/IntPort distorts StandardScaler if scaled in place, so add a
-# {col}_missing indicator per sentinel-bearing base column and impute the
-# sentinel to 0. Determined once from the full training set so the augmented
-# schema is fixed across every seed/condition/model -- verbatim from
-# cscas_logreg.py, see that module's docstring for the fuller rationale.
-SENTINEL_VALUE = -1
-SENTINEL_COLS = [c for c in FEATURE_COLS if (train[c] == SENTINEL_VALUE).any()]
-MODEL_FEATURE_COLS = FEATURE_COLS + [f"{c}_missing" for c in SENTINEL_COLS]
-print(f"Columns with -1 sentinel in train: {len(SENTINEL_COLS)} of {len(FEATURE_COLS)}")
-
-
-def add_missingness_flags(frame: pd.DataFrame) -> pd.DataFrame:
-    """Add a {col}_missing indicator per SENTINEL_COLS column and impute the
-    sentinel to 0 in place. Deterministic elementwise transform, safe to
-    apply identically to every pool and the eval subsample."""
-    frame = frame.copy()
-    for col in SENTINEL_COLS:
-        is_missing = frame[col] == SENTINEL_VALUE
-        frame[f"{col}_missing"] = is_missing.astype(int)
-        frame.loc[is_missing, col] = 0.0
-    return frame
-
-
 # Skip a model whose results/*.json already exists -- CSCAS_FORCE=1 to
-# recompute all three (RF plus the two new ones).
+# recompute. If ALL three models x both eval sets are already on disk for
+# this schema, exit before the (minutes-long) attribute-mining pass.
 FORCE = os.environ.get("CSCAS_FORCE", "0") == "1"
+_MINING_STEMS = ["cscas_mining", "cscas_mining_logreg", "cscas_mining_xgboost"]
+if grid_outputs_done(_MINING_STEMS, SCHEMA):
+    print(
+        f"[skip] all cscas_mining {SCHEMA} outputs already exist (CSCAS_FORCE=1 to re-run)."
+    )
+    raise SystemExit(0)
 
 # 5) Verify training pools against Table IV (pool construction itself lives
 # in _sampling.py -- these are just the sanity-check counts).
@@ -153,22 +137,30 @@ assert len(important) == 1_765, f"got {len(important)}"
 assert len(irr_inliers) == 133_614, f"got {len(irr_inliers)}"
 assert len(irr_outliers) == 4_153, f"got {len(irr_outliers)}"
 
-# 6) Prepare eval set -- shared, frozen subsample (same as cscas_base.py).
+# 6) Prepare eval sets -- both cells of the test-set axis.
+#   subsample: shared, frozen 20k -- the grid every baseline lives in.
+#   fulltest:  all 1.26M test rows -- the CSCAS paper's own protocol.
 eval_df = get_cscas_eval_subsample(test)
+EVAL_FRAMES = {"subsample": eval_df, "fulltest": test}
 print(
-    f"Evaluating on shared eval subsample: {len(eval_df)} rows, {int(eval_df['Label'].sum())} positive"
+    f"Evaluating on: subsample ({len(eval_df)} rows, {int(eval_df['Label'].sum())} pos)"
+    f"  +  full test ({len(test)} rows, {int(test['Label'].sum())} pos)"
 )
 
 # 7) Build AlertGroups for train and eval, using the same per-row parser
 # ingest_cscas_scenario() uses for the full dataset -- applied directly to
 # these row subsets rather than re-deriving a global sort order, so there's
 # no risk of pandas-vs-Python tie-breaking mismatches on duplicate
-# timestamps.
+# timestamps. The full-test parse+encode is the slow step (~1.26M rows).
 print("Building AlertGroups for train/eval splits...")
 train_groups = rows_to_cscas_alert_groups(train.to_dict("records"))
-eval_groups = rows_to_cscas_alert_groups(eval_df.to_dict("records"))
+eval_groups = {
+    ek: rows_to_cscas_alert_groups(frame.to_dict("records"))
+    for ek, frame in EVAL_FRAMES.items()
+}
 assert len(train_groups) == len(train), "row parsing dropped rows -- alignment broken"
-assert len(eval_groups) == len(eval_df), "row parsing dropped rows -- alignment broken"
+for ek, groups in eval_groups.items():
+    assert len(groups) == len(EVAL_FRAMES[ek]), f"row parsing dropped {ek} rows"
 
 # 8) Persist train_groups to JSON -- run_alert_group_attribute_mining_job
 # takes a file path, not an in-memory list.
@@ -221,7 +213,7 @@ print(f"  Built {len(symbolic_schema.features)} symbolic features.")
 
 encoder = SymbolicFeatureEncoder(feature_schema=symbolic_schema)
 symbolic_train_df = encoder.transform(train_groups)
-symbolic_eval_df = encoder.transform(eval_groups)
+symbolic_eval_df = {ek: encoder.transform(groups) for ek, groups in eval_groups.items()}
 
 # 11) Training pools (same 3 conditions as cscas_base.py) and per-model
 # feature-matrix / classifier builders.
@@ -232,21 +224,17 @@ POOL_BUILDERS = {
 }
 
 
-def build_matrix(
-    base_df: pd.DataFrame, symbolic_df: pd.DataFrame, model: str
-) -> np.ndarray:
-    """base_df rows aligned 1:1 (by position) with symbolic_df rows. LogReg
-    gets the missingness-flagged + imputed base columns (then everything
-    scaled in its Pipeline); RF/XGBoost get the raw base columns. The mined
-    symbolic columns are binary indicators -- passed through unchanged for
-    every model."""
-    base = (
-        add_missingness_flags(base_df)[MODEL_FEATURE_COLS]
-        if model == "logreg"
-        else base_df[FEATURE_COLS]
-    )
+def build_matrix(base_df: pd.DataFrame, symbolic_df: pd.DataFrame) -> np.ndarray:
+    """base_df rows aligned 1:1 (by position) with symbolic_df rows. Raw base
+    columns for every model -- the -1 sentinel is handled inside LogReg's own
+    Pipeline (sentinel_imputer), and RF/XGBoost treat -1 as a low value. The
+    mined symbolic columns are binary indicators, passed through unchanged."""
     return pd.concat(
-        [base.reset_index(drop=True), symbolic_df.reset_index(drop=True)], axis=1
+        [
+            base_df[FEATURE_COLS].reset_index(drop=True),
+            symbolic_df.reset_index(drop=True),
+        ],
+        axis=1,
     ).values
 
 
@@ -267,6 +255,7 @@ def build_classifier(model: str, seed: int, extra_kwargs: dict):
         )
     return Pipeline(
         [
+            ("impute", sentinel_imputer()),
             ("scaler", StandardScaler()),
             (
                 "clf",
@@ -287,61 +276,70 @@ MODELS = {
     "rf": ("cscas_mining", "RandomForestClassifier(n_estimators=100)"),
     "logreg": (
         "cscas_mining_logreg",
-        "StandardScaler + LogisticRegression (with -1-sentinel missingness "
-        "flags on the base columns)",
+        "median-imputed -1 sentinel + StandardScaler + LogisticRegression",
     ),
     "xgboost": ("cscas_mining_xgboost", "XGBClassifier(n_estimators=100)"),
 }
 
-for model, (result_name, model_desc) in MODELS.items():
-    if not FORCE and results_exist(result_name):
+for model, (stem, model_desc) in MODELS.items():
+    needed = {ek: result_name(stem, SCHEMA, ek) for ek in EVAL_FRAMES}
+    if not FORCE and all(results_exist(n) for n in needed.values()):
         print(
-            f"\n[skip] {result_name}.json already exists (set CSCAS_FORCE=1 to re-run)."
+            f"\n[skip] {model}: {list(needed.values())} already exist "
+            "(set CSCAS_FORCE=1 to re-run)."
         )
         continue
 
-    X_test = build_matrix(eval_df, symbolic_eval_df, model)
-    y_test = eval_df["Label"].values
-    results: dict[str, list[dict[str, float]]] = {name: [] for name in POOL_BUILDERS}
+    X_ev = {
+        ek: build_matrix(EVAL_FRAMES[ek], symbolic_eval_df[ek]) for ek in EVAL_FRAMES
+    }
+    y_ev = {ek: EVAL_FRAMES[ek]["Label"].values for ek in EVAL_FRAMES}
+    # results[eval_set][condition] -> per-seed metric dicts
+    results: dict[str, dict[str, list[dict[str, float]]]] = {
+        ek: {name: [] for name in POOL_BUILDERS} for ek in EVAL_FRAMES
+    }
 
     for condition, build_pool in POOL_BUILDERS.items():
-        print(f"\n=== {model} / {condition} (base schema + mining) ===")
+        print(f"\n=== {model} / {condition} ({SCHEMA} schema + mining) ===")
 
         for seed in range(5):
             pool, extra_kwargs = build_pool(seed)
 
             # pool.index gives positions into symbolic_train_df because train's
             # index labels equal positional row order (asserted in step 3).
-            X_tr = build_matrix(pool, symbolic_train_df.iloc[pool.index], model)
+            X_tr = build_matrix(pool, symbolic_train_df.iloc[pool.index])
             y_tr = pool["Label"].values
 
             clf = build_classifier(model, seed, extra_kwargs)
             clf.fit(X_tr, y_tr)
-            y_pred = clf.predict(X_test)
 
-            p = precision_score(y_test, y_pred)
-            r = recall_score(y_test, y_pred)
-            f = f1_score(y_test, y_pred)
-            results[condition].append({"precision": p, "recall": r, "f1": f})
-            print(f"  seed={seed}: P={p:.3f} R={r:.3f} F1={f:.3f}")
+            row = []
+            for ek in EVAL_FRAMES:
+                y_pred = clf.predict(X_ev[ek])
+                m = {
+                    "precision": precision_score(y_ev[ek], y_pred),
+                    "recall": recall_score(y_ev[ek], y_pred),
+                    "f1": f1_score(y_ev[ek], y_pred),
+                }
+                results[ek][condition].append(m)
+                row.append(f"{ek} F1={m['f1']:.3f}")
+            print(f"  seed={seed}: " + "  |  ".join(row))
 
-        avg = pd.DataFrame(results[condition]).mean()
-        print(f"  AVERAGE: P={avg.precision:.3f} R={avg.recall:.3f} F1={avg.f1:.3f}")
+        for ek in EVAL_FRAMES:
+            avg = pd.DataFrame(results[ek][condition]).mean()
+            print(
+                f"  AVERAGE [{ek}]: P={avg.precision:.3f} R={avg.recall:.3f} F1={avg.f1:.3f}"
+            )
 
-    print(f"\n=== Summary: base schema + mining ({model}) ===")
-    for condition in POOL_BUILDERS:
-        avg = pd.DataFrame(results[condition]).mean()
-        print(
-            f"{condition:<16}P={avg.precision:.3f} R={avg.recall:.3f} F1={avg.f1:.3f}"
+    for ek in EVAL_FRAMES:
+        save_baseline_results(
+            name=needed[ek],
+            description=(
+                f"{schema_blurb(SCHEMA, len(FEATURE_COLS))} + attribute-mined "
+                "symbolic features (contrast-set + decision-tree rules, mined on "
+                "the same train split as cscas_base; SCAS/Similarity-derived "
+                f"fields excluded from mining), {model_desc}, evaluated on the "
+                f"{'shared 20k eval subsample' if ek == 'subsample' else 'full 1.26M-row test set'}"
+            ),
+            results=results[ek],
         )
-
-    save_baseline_results(
-        name=result_name,
-        description=(
-            "Base schema (5 features) + attribute-mined symbolic features "
-            "(contrast-set + decision-tree rules, mined on the same train split "
-            "as cscas_base; SCAS/Similarity-derived fields excluded from "
-            f"mining), {model_desc}, evaluated on the shared eval subsample"
-        ),
-        results=results,
-    )

@@ -39,6 +39,15 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import OneClassSVM
 
+from thesis.baselines._cscas_schema import (
+    SCHEMAS_ANOMALY,
+    active_schema,
+    cscas_feature_cols,
+    grid_outputs_done,
+    result_name,
+    schema_blurb,
+    sentinel_imputer,
+)
 from thesis.baselines._results import save_anomaly_results
 from thesis.baselines._sampling import get_cscas_eval_subsample
 from thesis.training.workload import compute_workload_at_recall
@@ -67,81 +76,86 @@ assert len(test) == 1_255_792, f"got {len(test)}"
 assert train["Label"].sum() == 1_765, f"got {train['Label'].sum()}"
 assert test["Label"].sum() == 19_187, f"got {test['Label'].sum()}"
 
-# 4) Define feature columns -- same reduced set as cscas_base.py.
-DROP_COLS = [
-    "Timestamp",
-    "SignatureText",
-    "Label",
-    "ExtIP",
-    "IntIP",
-    "SignatureID",
-    "SCAS",
-]
-FEATURE_COLS = [
-    c for c in df.columns if c not in DROP_COLS and not c.endswith("Similarity")
-]
-
-assert len(FEATURE_COLS) == 5, f"got {len(FEATURE_COLS)}"
-print(f"Feature count: {len(FEATURE_COLS)}")
+# 4) Feature schema -- CSCAS_SCHEMA env var picks "base" (5 cols), or for
+# the full schema either "full_noscas" (40 cols, SignatureID + SCAS dropped)
+# or "full_scas" (41 cols, SCAS kept). Feeding a one-class detector CSCAS's
+# own precomputed outlier flag (SCAS) is circular, so "full_scas" is a
+# deliberately-circular diagnostic run. See _cscas_schema.py.
+SCHEMA = active_schema(SCHEMAS_ANOMALY)
+FEATURE_COLS = cscas_feature_cols(df, schema=SCHEMA)
+print(f"Schema: {SCHEMA} -- {len(FEATURE_COLS)} feature columns")
 print(FEATURE_COLS)
+
+if grid_outputs_done(["cscas_anomaly_ocsvm"], SCHEMA):
+    print(
+        f"[skip] cscas_anomaly_ocsvm {SCHEMA} outputs already exist (CSCAS_FORCE=1 to re-run)."
+    )
+    raise SystemExit(0)
+
+# 4b) OneClassSVM is scale-sensitive (StandardScaler in the pipeline), so
+# the -1 "not applicable" sentinel is median-imputed inside the Pipeline
+# (sentinel_imputer, fit on the benign train rows only) -- same treatment as
+# cscas_logreg.py. See _cscas_schema.py.
 
 # 5) Benign-only training data -- no pool conditions, no undersampling.
 train_benign = train[train["Label"] == 0]
 print(f"Training on {len(train_benign)} benign-only rows (natural count)")
 
-# 6) Shared, frozen eval subsample (same as cscas_base.py).
+# 6) Eval sets -- both cells of the test-set axis.
 eval_df = get_cscas_eval_subsample(test)
+EVAL_FRAMES = {"subsample": eval_df, "fulltest": test}
 X_train = train_benign[FEATURE_COLS].values
-X_test = eval_df[FEATURE_COLS].values
-y_test = eval_df["Label"].values
 print(
-    f"Evaluating on shared eval subsample: {len(eval_df)} rows, {int(eval_df['Label'].sum())} positive"
+    f"Evaluating on: subsample ({len(eval_df)} rows, {int(eval_df['Label'].sum())} pos)"
+    f"  +  full test ({len(test)} rows, {int(test['Label'].sum())} pos)"
 )
 
-# 7) Fit + score. Same estimator as model_factory's "ocsvm" (StandardScaler
-# + OneClassSVM(kernel='rbf', nu=0.05)) -- built inline so this script
-# doesn't pull in the classifier factory's heavier deps. Deterministic
-# convex fit, no random_state: a genuine single run.
+# 7) Fit once. Same estimator as model_factory's "ocsvm" (StandardScaler +
+# OneClassSVM(kernel='rbf', nu=0.05)), plus a sentinel_imputer() first step
+# -- built inline so this script doesn't pull in the classifier factory's
+# heavier deps. Deterministic convex fit, no random_state: a genuine single
+# run.
 model = Pipeline(
-    [("scaler", StandardScaler()), ("clf", OneClassSVM(kernel="rbf", nu=0.05))]
+    [
+        ("impute", sentinel_imputer()),
+        ("scaler", StandardScaler()),
+        ("clf", OneClassSVM(kernel="rbf", nu=0.05)),
+    ]
 )
 model.fit(X_train)
 
-scores = -model.decision_function(X_test)  # higher = more anomalous
-y_pred = (model.predict(X_test) == -1).astype(int)  # 1 = anomaly = attack
+for ek, frame in EVAL_FRAMES.items():
+    X_ev = frame[FEATURE_COLS].values
+    y_ev = frame["Label"].values
 
-auc = roc_auc_score(y_test, scores)
-p = precision_score(y_test, y_pred, zero_division=0)
-r = recall_score(y_test, y_pred, zero_division=0)
-f = f1_score(y_test, y_pred, zero_division=0)
+    scores = -model.decision_function(X_ev)  # higher = more anomalous
+    y_pred = (model.predict(X_ev) == -1).astype(int)  # 1 = anomaly = attack
 
-# Tuned-operating-point view: precision / FP / analyst-workload-reduction at
-# the threshold that hits each target recall (default 0.90/0.95/0.99). The
-# default nu=0.05 cut caps precision because it flags ~3x the true 1.5%
-# attack prevalence -- this reports the model at a sensible cut instead.
-workload = compute_workload_at_recall(y_test, scores)
+    auc = roc_auc_score(y_ev, scores)
+    p = precision_score(y_ev, y_pred, zero_division=0)
+    r = recall_score(y_ev, y_pred, zero_division=0)
+    f = f1_score(y_ev, y_pred, zero_division=0)
+    workload = compute_workload_at_recall(y_ev, scores)
 
-print("\n=== cscas_anomaly_ocsvm ===")
-print(f"AUC={auc:.3f} P={p:.3f} R={r:.3f} F1={f:.3f}  (default nu=0.05 cut)")
-if workload.get("0.90"):
-    w = workload["0.90"]
-    print(
-        f"  @recall>=0.90: P={w['precision']:.3f} FP={int(w['fp'])} "
-        f"workload_reduction={w['workload_reduction']:.3f}"
+    print(f"\n=== cscas_anomaly_ocsvm [{SCHEMA} / {ek}] ===")
+    print(f"AUC={auc:.3f} P={p:.3f} R={r:.3f} F1={f:.3f}  (default nu=0.05 cut)")
+    if workload.get("0.90"):
+        w = workload["0.90"]
+        print(
+            f"  @recall>=0.90: P={w['precision']:.3f} FP={int(w['fp'])} "
+            f"workload_reduction={w['workload_reduction']:.3f}"
+        )
+
+    save_anomaly_results(
+        name=result_name("cscas_anomaly_ocsvm", SCHEMA, ek),
+        description=(
+            "OneClassSVM(kernel='rbf', nu=0.05), median-imputed -1 sentinel + "
+            "StandardScaler, fit on benign-only rows of the "
+            f"{schema_blurb(SCHEMA, len(FEATURE_COLS))}, evaluated on the "
+            f"{'shared 20k eval subsample' if ek == 'subsample' else 'full 1.26M-row test set'}. "
+            "No attack rows used in training. precision/recall/f1 at the default "
+            "nu=0.05 cut; workload_at_recall is the tuned-threshold view."
+        ),
+        metrics={"auc": auc, "precision": p, "recall": r, "f1": f},
+        workload=workload,
     )
-
-save_anomaly_results(
-    name="cscas_anomaly_ocsvm",
-    description=(
-        "OneClassSVM(kernel='rbf', nu=0.05) fit on benign-only rows of "
-        "this project's reduced base schema (5 features -- SignatureID, "
-        "SCAS, and all Similarity columns removed, same as cscas_base.py), "
-        "evaluated on the shared eval subsample. No attack rows used in "
-        "training -- a workaround baseline for splits where train has zero "
-        "attack examples (see _ait_ads_data.py's AIT-ADS counterpart). "
-        "precision/recall/f1 are at the default nu=0.05 cut; "
-        "workload_at_recall is the tuned-threshold view."
-    ),
-    metrics={"auc": auc, "precision": p, "recall": r, "f1": f},
-    workload=workload,
-)

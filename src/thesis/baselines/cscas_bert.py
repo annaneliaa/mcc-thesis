@@ -75,7 +75,8 @@ from transformers import (
     TrainingArguments,
 )
 
-from thesis.baselines._results import save_baseline_results
+from thesis.baselines._cscas_schema import force_recompute
+from thesis.baselines._results import results_exist, save_baseline_results
 from thesis.baselines._sampling import (
     class_weighted_pool,
     get_cscas_eval_subsample,
@@ -149,6 +150,16 @@ assert (
 print(f"Fields serialized into text: {len(TEXT_FIELD_COLS)}")
 print(TEXT_FIELD_COLS)
 
+if (
+    not QUICK_SANITY_CHECK
+    and not force_recompute()
+    and all(results_exist(n) for n in ("cscas_bert", "cscas_bert_fulltest"))
+):
+    print(
+        "[skip] cscas_bert + cscas_bert_fulltest already exist (CSCAS_FORCE=1 to re-run)."
+    )
+    raise SystemExit(0)
+
 
 def build_text_column(frame: pd.DataFrame) -> pd.Series:
     """
@@ -168,23 +179,30 @@ def build_text_column(frame: pd.DataFrame) -> pd.Series:
     return text
 
 
-# 5) Prepare the shared, frozen eval subsample once, outside the seed loop.
-# Same subsample every other non-replication baseline uses -- see module
-# docstring for why this is no longer a timing-only ad hoc sample.
+# 5) Prepare both cells of the test-set axis once, outside the seed loop.
+#   subsample: shared, frozen 20k -- the grid every baseline lives in.
+#   fulltest:  all 1.26M test rows -- the CSCAS paper's own protocol
+#              (same fitted model, a second trainer.predict() -- adds a few
+#              minutes of inference per seed, no extra fine-tuning).
 eval_df = get_cscas_eval_subsample(test)
+EVAL_FRAMES = {"subsample": eval_df, "fulltest": test}
 print(
-    f"Evaluating on shared eval subsample: {len(eval_df)} rows, "
-    f"{int(eval_df['Label'].sum())} positive"
+    f"Evaluating on: subsample ({len(eval_df)} rows, {int(eval_df['Label'].sum())} pos)"
+    f"  +  full test ({len(test)} rows, {int(test['Label'].sum())} pos)"
 )
 
-print(f"Serializing eval subsample to text ({len(eval_df)} rows)...")
-test_df = pd.DataFrame(
-    {
-        "text": build_text_column(eval_df),
-        "label": eval_df["Label"].astype(int).values,
-    }
-)
-test_ds_base = Dataset.from_pandas(test_df[["text", "label"]], preserve_index=False)
+_eval_ds_base = {
+    ek: Dataset.from_pandas(
+        pd.DataFrame(
+            {
+                "text": build_text_column(frame),
+                "label": frame["Label"].astype(int).values,
+            }
+        ),
+        preserve_index=False,
+    )
+    for ek, frame in EVAL_FRAMES.items()
+}
 
 device = (
     "mps"
@@ -205,8 +223,8 @@ def tokenize(ds: Dataset) -> Dataset:
     return ds
 
 
-print("Tokenizing eval subsample...")
-test_ds = tokenize(test_ds_base)
+print("Tokenizing eval sets (subsample + full test)...")
+eval_ds = {ek: tokenize(ds) for ek, ds in _eval_ds_base.items()}
 data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
 
@@ -248,11 +266,12 @@ def run_seed(
     seed: int,
     class_weights: torch.Tensor | None,
     condition: str,
-) -> dict[str, float]:
+) -> dict[str, dict[str, float]]:
     """
-    Fine-tune DistilBERT from scratch on `pool`, evaluate once on the
-    shared eval subsample, and return precision/recall/f1 -- one point in
-    the N_SEEDS-seed average for `condition`.
+    Fine-tune DistilBERT from scratch on `pool`, evaluate the one fitted
+    model on both eval sets (subsample + full test), and return
+    {eval_set: {precision, recall, f1}} -- one point in the N_SEEDS-seed
+    average for `condition`.
     """
     t_start = time.time()
     pool_df = pd.DataFrame(
@@ -300,23 +319,27 @@ def run_seed(
     t_train_done = time.time()
     trainer.train()
     t_fit = time.time()
-    test_result = trainer.predict(test_ds)
+
+    out: dict[str, dict[str, float]] = {}
+    for ek, ds in eval_ds.items():
+        res = trainer.predict(ds)
+        preds = np.argmax(res.predictions, axis=1)
+        labels = res.label_ids
+        out[ek] = {
+            "precision": precision_score(labels, preds, zero_division=0),
+            "recall": recall_score(labels, preds, zero_division=0),
+            "f1": f1_score(labels, preds, zero_division=0),
+        }
     t_predict = time.time()
-    preds = np.argmax(test_result.predictions, axis=1)
-    labels = test_result.label_ids
 
     print(
         f"    [timing] setup={t_train_done - t_start:.1f}s "
         f"fit={t_fit - t_train_done:.1f}s "
         f"test_inference={t_predict - t_fit:.1f}s "
-        f"({len(test_ds)} eval rows)"
+        f"({', '.join(f'{ek}={len(ds)}' for ek, ds in eval_ds.items())} eval rows)"
     )
 
-    return {
-        "precision": precision_score(labels, preds, zero_division=0),
-        "recall": recall_score(labels, preds, zero_division=0),
-        "f1": f1_score(labels, preds, zero_division=0),
-    }
+    return out
 
 
 def class_weights_tensor(pool: pd.DataFrame, label_col: str = "Label") -> torch.Tensor:
@@ -341,7 +364,10 @@ POOL_BUILDERS = {
     "guided": lambda seed: guided_by_cscas_pool(train, important, seed),
 }
 
-results: dict[str, list[dict[str, float]]] = {name: [] for name in POOL_BUILDERS}
+# results[eval_set][condition] -> list of per-seed metric dicts
+results: dict[str, dict[str, list[dict[str, float]]]] = {
+    ek: {name: [] for name in POOL_BUILDERS} for ek in EVAL_FRAMES
+}
 
 for condition, build_pool in POOL_BUILDERS.items():
     print(f"\n=== {condition} (BERT, reduced fields as text) ===")
@@ -354,14 +380,21 @@ for condition, build_pool in POOL_BUILDERS.items():
             else None
         )
 
-        metrics = run_seed(pool, seed, class_weights=weights, condition=condition)
-        results[condition].append(metrics)
+        per_eval = run_seed(pool, seed, class_weights=weights, condition=condition)
+        for ek, m in per_eval.items():
+            results[ek][condition].append(m)
         print(
-            f"  seed={seed}: P={metrics['precision']:.3f} R={metrics['recall']:.3f} F1={metrics['f1']:.3f}"
+            "  seed={}: {}".format(
+                seed,
+                "  |  ".join(f"{ek} F1={m['f1']:.3f}" for ek, m in per_eval.items()),
+            )
         )
 
-    avg = pd.DataFrame(results[condition]).mean()
-    print(f"  AVERAGE: P={avg.precision:.3f} R={avg.recall:.3f} F1={avg.f1:.3f}")
+    for ek in EVAL_FRAMES:
+        avg = pd.DataFrame(results[ek][condition]).mean()
+        print(
+            f"  AVERAGE [{ek}]: P={avg.precision:.3f} R={avg.recall:.3f} F1={avg.f1:.3f}"
+        )
 
 if QUICK_SANITY_CHECK:
     print(
@@ -373,13 +406,15 @@ if QUICK_SANITY_CHECK:
         "[QUICK_SANITY_CHECK] Not saving results -- these numbers are smoke-test only."
     )
 else:
-    save_baseline_results(
-        name="cscas_bert",
-        description=(
-            "6 reduced fields (no SignatureID/SCAS/Similarity) serialized to text, "
-            "fine-tuned DistilBERT, all three training-pool conditions (random "
-            "undersampling, class-weighted, guided by CSCAS), evaluated on the "
-            "shared eval subsample"
-        ),
-        results=results,
-    )
+    for ek in EVAL_FRAMES:
+        save_baseline_results(
+            name="cscas_bert" if ek == "subsample" else "cscas_bert_fulltest",
+            description=(
+                "6 reduced fields (no SignatureID/SCAS/Similarity) serialized to "
+                "text, fine-tuned DistilBERT, all three training-pool conditions "
+                "(random undersampling, class-weighted, guided by CSCAS), "
+                "evaluated on the "
+                f"{'shared 20k eval subsample' if ek == 'subsample' else 'full 1.26M-row test set'}"
+            ),
+            results=results[ek],
+        )
