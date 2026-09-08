@@ -110,7 +110,7 @@ for scenario in "${SCENARIOS[@]}"; do
     echo "    FAILED — see $log_file"
     failed+=("$scenario")
   else
-    grep -E "Temporal decay results|Saved →" "$log_file" | tail -n 5 | sed 's/^/    /'
+    grep -E "Temporal decay results|Saved →|Mirrored →" "$log_file" | tail -n 6 | sed 's/^/    /'
   fi
 done
 

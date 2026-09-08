@@ -4,6 +4,9 @@ import datetime
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = ROOT / "configs"
 ARTIFACTS_DIR = ROOT / "artifacts"
+# Curated, human-facing outputs (LaTeX tables, mirrored experiment result
+# dirs) -- separate from artifacts/, which is scratch/regenerable.
+RESULTS_DIR = ROOT / "results"
 
 MODELS_DIR = ARTIFACTS_DIR / "models"
 ENCODERS_DIR = ARTIFACTS_DIR / "encoders"

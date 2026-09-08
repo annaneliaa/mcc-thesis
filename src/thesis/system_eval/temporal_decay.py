@@ -78,7 +78,10 @@ every schema feature, so the EDA notebook's per-horizon importance heatmap
 has no holes), lime_fidelity.csv (one row per config x horizon: LIME's own
 local-surrogate R^2, averaged over that horizon's explained sample --
 separate from explanations.csv since it's one number per horizon, not per
-feature), summary.txt, config.json.
+feature), summary.txt, config.json. Written under
+artifacts/experiments/temporal_decay/<scenario>/<ts>/ and, for a default
+run (no explicit results_dir), also copied verbatim to
+results/sys-eval/temporal-decay/<scenario>/<ts>/.
 
 fit_source_window and encode_target_window (below) are also the entry
 points thesis.experiments.instance_explain uses for on-demand, single-
@@ -88,6 +91,7 @@ positive at horizon 5") without re-running the whole sweep.
 
 from __future__ import annotations
 
+import shutil
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -115,7 +119,7 @@ from thesis.mining.window_schema_cache import (
     get_or_mine_slice_attribute_schema,
     get_or_mine_window_attribute_schema,
 )
-from thesis.paths import ensure_artifact_dirs
+from thesis.paths import RESULTS_DIR, ensure_artifact_dirs
 from thesis.pipeline.pipeline import compute_window_bounds, compute_window_train_end
 from thesis.schemas.experiments import TemporalDecayConfig
 from thesis.schemas.features import FeatureSchema
@@ -126,6 +130,10 @@ from thesis.training.explain import (
 
 _ROOT = Path(__file__).resolve().parents[3]
 _EXPERIMENTS_DIR = _ROOT / "artifacts" / "experiments" / "temporal_decay"
+# A default run's output dir is also copied here, verbatim, as the curated,
+# human-facing home for temporal-decay results (kept out of the regenerable
+# artifacts/ tree). Skipped when the caller passes an explicit results_dir.
+_RESULTS_MIRROR_DIR = RESULTS_DIR / "sys-eval" / "temporal-decay"
 
 
 @dataclass(slots=True)
@@ -654,6 +662,17 @@ def run_temporal_decay_experiment(config: TemporalDecayConfig) -> Path:
         .apply(str)
         .to_json(indent=2)
     )
+
+    # Mirror the finished run into the curated results/ tree (unless the
+    # caller chose their own output location). Best-effort -- a copy failure
+    # must not lose the primary run under out_dir.
+    if config.results_dir is None:
+        mirror_dir = _RESULTS_MIRROR_DIR / scenario / ts
+        try:
+            shutil.copytree(out_dir, mirror_dir, dirs_exist_ok=True)
+            print(f"  Mirrored → {mirror_dir}")
+        except OSError as exc:
+            print(f"  [warn] could not mirror results to {mirror_dir}: {exc}")
 
     return out_dir
 
