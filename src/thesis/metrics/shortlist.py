@@ -24,7 +24,7 @@ REQUIRED_COLUMNS = ["feature_set", "mining_setting", "granularity", "model"]
 
 @dataclass(frozen=True, slots=True)
 class ShortlistedConfig:
-    feature_set: str  # "baseline" | "symbolic"
+    feature_set: str  # "baseline" | "symbolic" | "cscas_full"
     mining_setting: str | None
     granularity: float
     model: str
@@ -54,11 +54,11 @@ def load_shortlist(path: Path) -> list[ShortlistedConfig]:
         )
         model = str(row["model"]).strip()
 
-        if feature_set == "baseline":
+        if feature_set in ("baseline", "cscas_full"):
             if mining_setting is not None:
                 raise ValueError(
-                    f"Shortlist row {i}: feature_set='baseline' must not carry a "
-                    f"mining_setting (got {mining_setting!r})"
+                    f"Shortlist row {i}: feature_set={feature_set!r} must not carry "
+                    f"a mining_setting (got {mining_setting!r})"
                 )
         elif feature_set == "symbolic":
             if mining_setting is None:
@@ -69,7 +69,7 @@ def load_shortlist(path: Path) -> list[ShortlistedConfig]:
         else:
             raise ValueError(
                 f"Shortlist row {i}: unrecognized feature_set {feature_set!r} "
-                "(expected 'baseline' or 'symbolic')"
+                "(expected 'baseline', 'symbolic' or 'cscas_full')"
             )
 
         if model not in MODEL_FACTORIES:

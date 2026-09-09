@@ -9,8 +9,12 @@ import pytest
 from thesis.system_eval.temporal_decay import (
     WindowScheme,
     _build_decay_summary,
+    _cscas_full_schema,
+    _group_type_keys,
+    _novelty_metrics,
     _resolve_baseline_split_idx,
 )
+from thesis.schemas.groups import AlertGroup
 from thesis.experiments._shared import (
     decide_threshold,
     fit_scored_model,
@@ -175,6 +179,39 @@ def test_load_shortlist_missing_column_raises(tmp_path):
         load_shortlist(path)
 
 
+def test_load_shortlist_accepts_cscas_full_without_mining_setting(tmp_path):
+    path = _write_csv(
+        tmp_path,
+        [
+            {
+                "feature_set": "cscas_full",
+                "mining_setting": "",
+                "granularity": 0.25,
+                "model": "iforest",
+            }
+        ],
+    )
+    configs = load_shortlist(path)
+    assert configs[0].feature_set == "cscas_full"
+    assert configs[0].mining_setting is None
+
+
+def test_load_shortlist_cscas_full_with_mining_setting_raises(tmp_path):
+    path = _write_csv(
+        tmp_path,
+        [
+            {
+                "feature_set": "cscas_full",
+                "mining_setting": "gr3.0_md3",
+                "granularity": 0.25,
+                "model": "logreg",
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="must not carry"):
+        load_shortlist(path)
+
+
 def test_load_shortlist_baseline_with_mining_setting_raises(tmp_path):
     path = _write_csv(
         tmp_path,
@@ -293,3 +330,76 @@ def test_fixed_threshold_for_supervised_model_stays_at_half():
         decide_threshold(y, model.predict_proba(X)[:, 1], "fixed", 0.9, model=model)
         == 0.5
     )
+
+
+# ---- _cscas_full_schema ----------------------------------------------------
+
+
+def test_cscas_full_schema_keeps_scas_for_classifiers_drops_it_for_one_class():
+    clf = _cscas_full_schema("logreg")
+    assert clf.base.kind == "cscas_full"
+    assert "scas" in clf.base.features
+    assert clf.symbolic is None
+
+    for one_class in ("iforest", "ocsvm"):
+        sch = _cscas_full_schema(one_class)
+        assert "scas" not in sch.base.features
+        assert len(sch.base.features) == len(clf.base.features) - 1
+
+
+# ---- per-horizon novelty --------------------------------------------------
+
+
+def _grp(items, category="EXPLOIT", ruleset="ET", proto=6, label="benign"):
+    return AlertGroup(
+        alert_group_id="x",
+        group_id="x",
+        method="cscas_pregrouped",
+        start_ts=1_642_636_800,
+        end_ts=1_642_636_800,
+        n_alerts=1,
+        group_label=label,
+        raw_items=set(items),
+        category=category,
+        ruleset=ruleset,
+        proto=proto,
+    )
+
+
+def test_novelty_metrics_counts_unseen_type_keys():
+    train = [_grp(["a", "b"]), _grp(["c"], category="DNS", proto=17)]
+    train_items, train_crp = _group_type_keys(train)
+
+    window = [
+        _grp(["a", "b"]),  # seen items + crp
+        _grp(["d"], label="attack"),  # novel items, seen crp
+        _grp(["e"], category="SQL", proto=6, label="attack"),  # novel items + crp
+    ]
+    nov = _novelty_metrics(window, train_items, train_crp)
+
+    assert nov["n_groups_win"] == 3
+    assert nov["n_attack_win"] == 2
+    assert nov["n_novel_items"] == 2
+    assert nov["frac_novel_items"] == pytest.approx(2 / 3)
+    assert nov["n_new_item_types"] == 2
+    assert nov["n_novel_items_attack"] == 2
+    assert nov["frac_novel_items_attack"] == pytest.approx(1.0)
+    assert nov["n_novel_crp"] == 1
+    assert nov["n_new_crp_types"] == 1
+    assert nov["n_novel_crp_attack"] == 1
+
+
+def test_novelty_metrics_empty_window_is_zero_counts_nan_fracs():
+    nov = _novelty_metrics([], set(), set())
+    assert nov["n_groups_win"] == 0
+    assert nov["n_novel_items"] == 0
+    assert np.isnan(nov["frac_novel_items"])
+    assert np.isnan(nov["frac_novel_crp_attack"])
+
+
+def test_novelty_metrics_attack_fracs_nan_when_window_has_no_attacks():
+    train_items, train_crp = _group_type_keys([_grp(["a"])])
+    nov = _novelty_metrics([_grp(["z"])], train_items, train_crp)
+    assert nov["n_novel_items"] == 1
+    assert nov["n_attack_win"] == 0
+    assert np.isnan(nov["frac_novel_items_attack"])

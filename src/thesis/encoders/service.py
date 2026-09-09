@@ -5,6 +5,7 @@ import pandas as pd
 from thesis.schemas.groups import AlertGroup
 from thesis.schemas.features import FeatureSchema
 from thesis.encoders.baseline import BaselineFeatureEncoder
+from thesis.encoders.cscas_full import CscasFullFeatureEncoder
 from thesis.encoders.symbolic import SymbolicFeatureEncoder
 
 
@@ -18,7 +19,12 @@ def encode_alert_groups_for_schema(
     frames: list[pd.DataFrame] = []
 
     if schema.base is not None:
-        baseline_frame = BaselineFeatureEncoder().transform(alert_groups_list)
+        base_encoder = (
+            CscasFullFeatureEncoder()
+            if getattr(schema.base, "kind", "baseline") == "cscas_full"
+            else BaselineFeatureEncoder()
+        )
+        baseline_frame = base_encoder.transform(alert_groups_list)
 
         baseline_frame = baseline_frame.reindex(
             columns=schema.base.features,

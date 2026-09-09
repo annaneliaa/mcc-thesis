@@ -5,6 +5,14 @@ from typing import Literal
 @dataclass(frozen=True, slots=True)
 class BaseFeatureSchema:
     features: list[str] = field(default_factory=list)
+    # Which base encoder encode_alert_groups_for_schema uses:
+    # "baseline" -> encoders.baseline (the deployment-realistic reduced
+    # column set); "cscas_full" -> encoders.cscas_full (the CSCAS paper's
+    # full 41-column set incl. SCAS + offline *Similarity scores -- a
+    # non-deployable reference ceiling, used by the temporal-decay
+    # experiment). Defaults to "baseline" so every existing caller is
+    # unchanged.
+    kind: str = "baseline"
 
 
 @dataclass(frozen=True, slots=True)

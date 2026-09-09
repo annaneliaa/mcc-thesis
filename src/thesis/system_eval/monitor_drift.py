@@ -135,6 +135,13 @@ def fit_source_window_and_dynamic_schema(
     decide a frozen threshold from its own scores. Returns None (warns,
     never raises) for the same non-fatal "this config can't run" conditions
     fit_source_window does."""
+    if cfg.feature_set == "cscas_full":
+        print(
+            "  [warn] feature_set='cscas_full' is only supported by the "
+            "temporal-decay experiment -- skipping this config"
+        )
+        return None
+
     gran = cfg.granularity
     win_start, win_end, n_windows = compute_window_bounds(n_total, gran, 0)
     win_train_end = compute_window_train_end(

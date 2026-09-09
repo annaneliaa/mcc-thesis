@@ -108,6 +108,13 @@ def fit_window(
     raises) if the mining setting can't be resolved or the window turns out
     to be single-class -- both non-fatal, "this step can't run" conditions
     the caller is expected to skip past."""
+    if cfg.feature_set == "cscas_full":
+        print(
+            "  [warn] feature_set='cscas_full' is only supported by the "
+            "temporal-decay experiment -- skipping this config"
+        )
+        return None
+
     gran = cfg.granularity
     win_start, win_end, _ = compute_window_bounds(n_total, gran, win_idx)
     window_rows = alert_groups[win_start:win_end]

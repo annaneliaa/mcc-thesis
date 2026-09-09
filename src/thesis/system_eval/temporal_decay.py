@@ -8,6 +8,19 @@ trained on the *first* chronological window still discriminates well on
 future windows, how AUC/F1/etc and FPR decay as temporal distance increases,
 and how per-feature importances drift alongside that decay.
 
+feature_set is one of:
+  * "baseline"  -- the deployment-realistic reduced base columns only
+    (encoders.baseline), no symbolic features.
+  * "symbolic"  -- base + a schema mined on W_src's train split.
+  * "cscas_full" -- the CSCAS paper's own full feature set
+    (encoders.cscas_full: base + SCAS + Similarity + SignatureIDSimilarity
+    + 33 attr-similarity columns). SCAS and the offline *Similarity scores
+    are not computable for a fresh alert, so this is a non-deployable
+    *reference ceiling* -- "does the frozen model decay even with the
+    paper's full oracle features?" -- not a candidate schema. SCAS is
+    dropped for one-class models (it is itself an anomaly score). Added by
+    the runner's --cscas-full flag; carries no mining_setting.
+
 Models: supervised classifiers (logreg, xgboost, ...) fit on the mixed W_src
 train split, every one made class-imbalance-aware (class_weight="balanced"
 / scale_pos_weight); one-class anomaly detectors (iforest, ocsvm) fit
@@ -70,6 +83,16 @@ sweep):
      features move the score, and which way), not model-*performance*
      attributions.
 
+Every per_horizon_results.csv row also carries alert-group *novelty*
+columns (schema/model-independent, so one series covers every config at a
+given granularity + source split): each horizon window's groups are keyed
+at two grains -- the raw_items token-set (the unit symbolic mining
+operates on) and the coarser (category, ruleset, proto) tuple -- and
+scored against the set of keys seen anywhere in W_src's train span.
+n_novel_items / frac_novel_items / n_new_item_types (and the _crp and
+_*_attack variants) let the EDA notebook line the metric-decay rate up
+against how much genuinely unseen traffic each window brings.
+
 Outputs: per_horizon_results.csv (one row per config x horizon window,
 including the h=0 held-out anchor), decay_summary.csv (score/FPR at h=0 vs
 the last horizon actually run, and their difference), explanations.csv
@@ -94,17 +117,19 @@ from __future__ import annotations
 import shutil
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+from thesis.encoders.cscas_full import CSCAS_FULL_FEATURES
 from thesis.encoders.service import encode_alert_groups_for_schema
 from thesis.experiments._shared import (
     CONFIG_COLS,
     METRIC_COLS,
+    ONE_CLASS_MODELS,
     decide_threshold,
     fit_scored_model,
     labels_and_mask,
@@ -122,7 +147,7 @@ from thesis.mining.window_schema_cache import (
 from thesis.paths import RESULTS_DIR, ensure_artifact_dirs
 from thesis.pipeline.pipeline import compute_window_bounds, compute_window_train_end
 from thesis.schemas.experiments import TemporalDecayConfig
-from thesis.schemas.features import FeatureSchema
+from thesis.schemas.features import BaseFeatureSchema, FeatureSchema
 from thesis.training.explain import (
     compute_lime_signed_importances,
     compute_shap_signed_importances,
@@ -218,6 +243,105 @@ def _build_window_scheme(
     return WindowScheme("baseline_split", n_total, split_idx)
 
 
+def _cscas_full_schema(model_name: str) -> FeatureSchema:
+    """The CSCAS paper's full feature set (encoders.cscas_full) as a
+    base-only FeatureSchema. `scas` -- CSCAS's own precomputed
+    outlier/inlier score -- is dropped for one-class models, since feeding
+    an anomaly score into an anomaly detector is circular; it's kept for
+    supervised classifiers, matching the paper's own protocol."""
+    feats = [
+        f
+        for f in CSCAS_FULL_FEATURES
+        if not (f == "scas" and model_name in ONE_CLASS_MODELS)
+    ]
+    return FeatureSchema(
+        schema_name="cscas_full",
+        schema_version="0.1.0",
+        base=BaseFeatureSchema(feats, kind="cscas_full"),
+        symbolic=None,
+    )
+
+
+# --- Per-horizon alert-group novelty ------------------------------------
+# "Type" of an alert group at two grains, both schema/model-independent so
+# one novelty series covers every config at a given (granularity, source
+# split): the raw_items token-set (the unit symbolic mining actually
+# operates on -- a token-set unseen in training is a pattern the frozen
+# schema never had a chance to encode) and the coarser (category, ruleset,
+# proto) tuple. A group counts as "novel" at a horizon if its key was not
+# present anywhere in W_src's train span.
+
+_NOVELTY_COUNT_COLS = (
+    "n_groups_win",
+    "n_attack_win",
+    "n_novel_items",
+    "n_new_item_types",
+    "n_novel_items_attack",
+    "n_novel_crp",
+    "n_new_crp_types",
+    "n_novel_crp_attack",
+)
+_NOVELTY_FRAC_COLS = (
+    "frac_novel_items",
+    "frac_novel_items_attack",
+    "frac_novel_crp",
+    "frac_novel_crp_attack",
+)
+
+
+def _items_key(g) -> frozenset:
+    return frozenset(g.raw_items or ())
+
+
+def _crp_key(g) -> tuple:
+    return (g.category, g.ruleset, g.proto)
+
+
+def _group_type_keys(rows: list) -> tuple[set, set]:
+    """(raw_items token-set keys, (category, ruleset, proto) keys) over `rows`."""
+    return {_items_key(g) for g in rows}, {_crp_key(g) for g in rows}
+
+
+def _novelty_metrics(rows: list, train_items: set, train_crp: set) -> dict:
+    """Novelty of `rows` (one horizon window, unmasked) against W_src's
+    train-span type keys -- group-level counts/fractions and the number of
+    distinct new types. Attack fractions are over that window's own attack
+    count (nan when it has none)."""
+    n = len(rows)
+    if n == 0:
+        return {
+            **{c: 0 for c in _NOVELTY_COUNT_COLS},
+            **{c: np.nan for c in _NOVELTY_FRAC_COLS},
+        }
+    labels, _ = labels_and_mask(rows)
+    is_atk = labels == 1
+    n_atk = int(is_atk.sum())
+
+    item_keys = [_items_key(g) for g in rows]
+    crp_keys = [_crp_key(g) for g in rows]
+    nov_i = np.array([k not in train_items for k in item_keys])
+    nov_c = np.array([k not in train_crp for k in crp_keys])
+
+    return {
+        "n_groups_win": n,
+        "n_attack_win": n_atk,
+        "n_novel_items": int(nov_i.sum()),
+        "frac_novel_items": float(nov_i.mean()),
+        "n_new_item_types": len(set(item_keys) - train_items),
+        "n_novel_items_attack": int((nov_i & is_atk).sum()),
+        "frac_novel_items_attack": (
+            float((nov_i & is_atk).sum() / n_atk) if n_atk else np.nan
+        ),
+        "n_novel_crp": int(nov_c.sum()),
+        "frac_novel_crp": float(nov_c.mean()),
+        "n_new_crp_types": len(set(crp_keys) - train_crp),
+        "n_novel_crp_attack": int((nov_c & is_atk).sum()),
+        "frac_novel_crp_attack": (
+            float((nov_c & is_atk).sum() / n_atk) if n_atk else np.nan
+        ),
+    }
+
+
 @dataclass(slots=True)
 class SourceWindowFit:
     """Everything frozen once window 0's train split is mined+fit: the
@@ -239,6 +363,12 @@ class SourceWindowFit:
     X_test: pd.DataFrame
     y_test: np.ndarray
     scheme: WindowScheme
+    # W_src train-span type keys + the raw (unmasked) h=0 held-out rows, for
+    # the per-horizon novelty columns. Defaulted so callers that build a
+    # SourceWindowFit directly (older tests) don't have to supply them.
+    train_item_keys: set = field(default_factory=set)
+    train_crp_keys: set = field(default_factory=set)
+    h0_rows: list = field(default_factory=list)
 
 
 def fit_source_window(
@@ -295,6 +425,8 @@ def fit_source_window(
     cache_hit = None
     if cfg.feature_set == "baseline":
         schema = base_schema
+    elif cfg.feature_set == "cscas_full":
+        schema = _cscas_full_schema(cfg.model)
     elif scheme.mode == "baseline_split":
         tf_tag = f"{train_frac_within_window:.6f}".rstrip("0").rstrip(".")
         schema_result = get_or_mine_slice_attribute_schema(
@@ -375,6 +507,12 @@ def fit_source_window(
         y_train, proba_train, threshold_mode, calibrated_recall_target, model=model
     )
 
+    # Novelty reference: type keys over W_src's *train* span (unmasked --
+    # every group the schema/model was derived from, labelled or not), plus
+    # the raw held-out rows that h=0 is scored on.
+    train_item_keys, train_crp_keys = _group_type_keys(window_rows[:local_train_end])
+    h0_rows = window_rows[local_train_end:]
+
     return SourceWindowFit(
         schema=schema,
         model=model,
@@ -387,6 +525,9 @@ def fit_source_window(
         X_test=X_test,
         y_test=y_test,
         scheme=scheme,
+        train_item_keys=train_item_keys,
+        train_crp_keys=train_crp_keys,
+        h0_rows=h0_rows,
     )
 
 
@@ -738,10 +879,12 @@ def _run_one_config(
         X_h: pd.DataFrame,
         y_h: np.ndarray,
         n_alert_groups_h: int,
+        raw_rows_h: list,
     ) -> None:
         horizon_fraction = (
             horizon_window_index / (fit.n_windows - 1) if fit.n_windows > 1 else 0.0
         )
+        novelty = _novelty_metrics(raw_rows_h, fit.train_item_keys, fit.train_crp_keys)
         if len(y_h) == 0:
             print(
                 f"    [warn] horizon {horizon_window_index} has no labeled rows "
@@ -757,6 +900,7 @@ def _run_one_config(
                     "n_alert_groups": n_alert_groups_h,
                     "n_attack": 0,
                     **nan_metrics(),
+                    **novelty,
                 }
             )
             return
@@ -774,6 +918,7 @@ def _run_one_config(
                 "n_alert_groups": n_alert_groups_h,
                 "n_attack": int(np.nansum(y_h)),
                 **metrics,
+                **novelty,
             }
         )
         if config.compute_explanations:
@@ -791,12 +936,13 @@ def _run_one_config(
             fidelity_rows.extend(cfg_fidelity_rows)
 
     # h=0: W_src's own held-out test split -- never seen by mining or fitting.
-    _record_horizon(0, fit.X_test, fit.y_test, len(fit.X_test))
+    _record_horizon(0, fit.X_test, fit.y_test, len(fit.X_test), fit.h0_rows)
 
     for k in range(1, fit.n_windows):
         X_tgt, y_tgt, n_alert_groups = encode_target_window(
             alert_groups, fit.scheme, fit.gran, k, fit.schema
         )
-        _record_horizon(k, X_tgt, y_tgt, n_alert_groups)
+        t_start, t_end = fit.scheme.target_bounds(fit.gran, k)
+        _record_horizon(k, X_tgt, y_tgt, n_alert_groups, alert_groups[t_start:t_end])
 
     return horizon_rows, explain_rows, fidelity_rows

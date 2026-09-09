@@ -119,6 +119,19 @@ def main() -> None:
         help="Don't add a baseline row per (granularity, model) to the derived shortlist.",
     )
     parser.add_argument(
+        "--cscas-full",
+        action="store_true",
+        dest="include_cscas_full",
+        help=(
+            "Add a cscas_full feature-set row per (granularity, model): the CSCAS "
+            "paper's full feature set (5 base cols + SCAS + Similarity + "
+            "SignatureIDSimilarity + 33 attr-similarity columns). A non-deployable "
+            "reference ceiling -- SCAS and the offline *Similarity scores can't be "
+            "computed for a fresh alert. SCAS is dropped for one-class models "
+            "(it's itself an anomaly inlier/outlier score). CSCAS only."
+        ),
+    )
+    parser.add_argument(
         "--train-frac",
         type=float,
         default=0.7,
@@ -242,6 +255,7 @@ def main() -> None:
             args.granularities,
             args.models,
             args.include_baseline,
+            args.include_cscas_full,
         )
         derived_dir = (
             _REPO / "artifacts" / "experiments" / "temporal_decay" / args.scenario
