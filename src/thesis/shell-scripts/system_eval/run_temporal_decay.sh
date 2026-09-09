@@ -20,26 +20,30 @@
 
 set -uo pipefail
 
-# Don't rely on the caller's shell already having the right env active --
-# activate it explicitly so this script works the same from a cron job, CI,
-# a bare terminal, or `docker exec`. Override the env name for a context
-# where it isn't called `thesis` (e.g. THESIS_CONDA_ENV=base inside a
-# container image whose project deps live in base):
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
+export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+
+# Best-effort conda activation. Default env "thesis" (a dev box); override
+# with THESIS_CONDA_ENV for a context where it's named differently -- e.g.
+# inside a container whose deps live in base:
 #   THESIS_CONDA_ENV=base bash run_temporal_decay.sh
+# A missing conda or missing env is only a warning: fall through to whatever
+# `python` is already active. PYTHONPATH above means the package needn't be
+# pip-installed (run_temporal_decay.py also self-inserts src/ as a backstop).
 CONDA_ENV="${THESIS_CONDA_ENV:-thesis}"
-source "$(conda info --base)/etc/profile.d/conda.sh"
-if ! conda activate "$CONDA_ENV"; then
-  echo "FATAL: could not 'conda activate $CONDA_ENV' -- set THESIS_CONDA_ENV to" \
-       "the env holding the project deps ($(conda env list | awk 'NR>2{print $1}' | paste -sd' ' -))" >&2
+if command -v conda >/dev/null 2>&1; then
+  source "$(conda info --base)/etc/profile.d/conda.sh"
+  conda activate "$CONDA_ENV" 2>/dev/null \
+    || echo "  [warn] 'conda activate $CONDA_ENV' failed -- using $(command -v python)" >&2
+fi
+
+if ! python -c "import thesis, sklearn, numpy, pandas" 2>/dev/null; then
+  echo "FATAL: active python ($(command -v python)) can't import the core deps" \
+       "(thesis/sklearn/numpy/pandas). Set THESIS_CONDA_ENV to the right env." >&2
   exit 1
 fi
-python -c "import thesis, sklearn" 2>/dev/null || {
-  echo "FATAL: env '$CONDA_ENV' is active but 'import thesis' fails -- wrong env?" >&2
-  exit 1
-}
 
 SCENARIOS=(cscas)
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 MINING_SETTINGS="$REPO_ROOT/src/thesis/configs/screening_mining_settings.yaml"
 GRANULARITIES=(0.1)  # one granularity keeps the run lean; 0.1 gives the most
                      # horizon windows (finest decay/drift curve). Add 0.25 0.5
@@ -84,6 +88,14 @@ COMPUTE_EXPLANATIONS=1  # 0 to skip SHAP/LIME entirely (metrics + novelty only)
 ONECLASS_SHAP=0         # 1 to also compute (slow) SHAP for iforest/ocsvm
 EXPLAIN_SAMPLE_N=50
 LIME_NUM_SAMPLES=1000
+
+# If explanations are on but shap/lime aren't importable in this env, drop
+# to metrics-only rather than failing the whole run partway through.
+if [[ "$COMPUTE_EXPLANATIONS" -eq 1 ]] && ! python -c "import shap, lime" 2>/dev/null; then
+  echo "  [warn] shap/lime not importable -- running metrics + novelty only" \
+       "(COMPUTE_EXPLANATIONS=0)" >&2
+  COMPUTE_EXPLANATIONS=0
+fi
 
 LOG_DIR="$REPO_ROOT/artifacts/logs/temporal_decay"
 mkdir -p "$LOG_DIR"
