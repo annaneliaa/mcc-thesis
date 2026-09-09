@@ -20,16 +20,31 @@
 
 set -uo pipefail
 
-# Don't rely on the caller's shell already having `thesis` active -- activate
-# it explicitly so this script works the same from a cron job, CI, or a
-# terminal that's sitting in base/another env.
+# Don't rely on the caller's shell already having the right env active --
+# activate it explicitly so this script works the same from a cron job, CI,
+# a bare terminal, or `docker exec`. Override the env name for a context
+# where it isn't called `thesis` (e.g. THESIS_CONDA_ENV=base inside a
+# container image whose project deps live in base):
+#   THESIS_CONDA_ENV=base bash run_temporal_decay.sh
+CONDA_ENV="${THESIS_CONDA_ENV:-thesis}"
 source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate thesis
+if ! conda activate "$CONDA_ENV"; then
+  echo "FATAL: could not 'conda activate $CONDA_ENV' -- set THESIS_CONDA_ENV to" \
+       "the env holding the project deps ($(conda env list | awk 'NR>2{print $1}' | paste -sd' ' -))" >&2
+  exit 1
+fi
+python -c "import thesis, sklearn" 2>/dev/null || {
+  echo "FATAL: env '$CONDA_ENV' is active but 'import thesis' fails -- wrong env?" >&2
+  exit 1
+}
 
 SCENARIOS=(cscas)
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 MINING_SETTINGS="$REPO_ROOT/src/thesis/configs/screening_mining_settings.yaml"
-GRANULARITIES=(0.1 0.25 0.5)  # keep to the mining grid's MINE_FRACS so every gran has structural backing
+GRANULARITIES=(0.1)  # one granularity keeps the run lean; 0.1 gives the most
+                     # horizon windows (finest decay/drift curve). Add 0.25 0.5
+                     # back for the cross-granularity comparison. Keep to the
+                     # mining grid's MINE_FRACS so every gran has structural backing.
 # Every model is crossed with every (grid setting x granularity). logreg and
 # xgboost are supervised (fit on the mixed W_src train split); iforest and
 # ocsvm are one-class -- fit unsupervised on the benign rows, then Platt-scaled
@@ -52,11 +67,21 @@ CALIBRATED_RECALL_TARGET="0.90"  # only used when THRESHOLD_MODE=calibrated_reca
 #                     baseline reports on that same test set. CSCAS only;
 #                     --source-split-time defaults to the CSCAS boundary.
 SOURCE_SPLIT_MODE="baseline_split"  # or "window0"
-# SHAP/LIME per horizon is cheap for logreg (LinearExplainer) and xgboost
-# (TreeExplainer) but slow for iforest/ocsvm (no analytic explainer -- SHAP
-# falls back to PermutationExplainer over ~325 features). Drop EXPLAIN_SAMPLE_N
-# or set COMPUTE_EXPLANATIONS=0 for a faster first pass.
-COMPUTE_EXPLANATIONS=0  # 0 to skip SHAP/LIME (metrics only, much faster)
+# CSCAS_FULL=1 adds one cscas_full feature-set row per (granularity, model):
+# the CSCAS paper's own full feature set (5 base cols + SCAS + Similarity +
+# SignatureIDSimilarity + 33 attr-similarity columns). A non-deployable
+# *reference ceiling* -- SCAS and the offline *Similarity scores can't be
+# computed for a fresh alert -- for "does the frozen model decay even with
+# the paper's full oracle features?". SCAS is dropped for the one-class
+# models (it is itself an anomaly score). CSCAS only.
+CSCAS_FULL=1  # 0 to skip the cscas_full arm
+# SHAP/LIME per horizon. logreg (LinearExplainer) and xgboost (TreeExplainer)
+# get analytic SHAP + LIME. iforest/ocsvm have no analytic SHAP explainer, so
+# by default (ONECLASS_SHAP=0) they get LIME only -- the PermutationExplainer
+# fallback over every feature at every horizon is what used to make this run
+# take hours. Set ONECLASS_SHAP=1 to pay for it.
+COMPUTE_EXPLANATIONS=1  # 0 to skip SHAP/LIME entirely (metrics + novelty only)
+ONECLASS_SHAP=0         # 1 to also compute (slow) SHAP for iforest/ocsvm
 EXPLAIN_SAMPLE_N=50
 LIME_NUM_SAMPLES=1000
 
@@ -102,6 +127,12 @@ for scenario in "${SCENARIOS[@]}"; do
   fi
   if [[ "$COMPUTE_EXPLANATIONS" -eq 0 ]]; then
     cmd+=(--no-explanations)
+  fi
+  if [[ "${ONECLASS_SHAP:-0}" -eq 1 ]]; then
+    cmd+=(--oneclass-shap)
+  fi
+  if [[ "${CSCAS_FULL:-0}" -eq 1 ]]; then
+    cmd+=(--cscas-full)
   fi
 
   "${cmd[@]}" >"$log_file" 2>&1

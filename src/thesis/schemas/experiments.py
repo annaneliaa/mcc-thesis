@@ -202,6 +202,15 @@ class TemporalDecayConfig:
     # own default is 5000; kept lower here since it's paid n_windows x
     # explain_sample_n times per config)
     lime_num_samples: int = 1000
+    # One-class models (iforest, ocsvm) have no analytic SHAP explainer, so
+    # SHAP falls back to PermutationExplainer over every feature at every
+    # horizon -- the dominant cost of a compute_explanations run by a wide
+    # margin (~hours vs ~minutes). Off by default: the one-class models get
+    # LIME importances only (LIME is model-agnostic and, being the same
+    # local-linear surrogate for every model, the more consistent basis for
+    # the classifier-vs-anomaly importance-drift comparison anyway). Set
+    # True to pay for one-class SHAP too.
+    oneclass_shap: bool = False
     cache_dir: Path = field(default_factory=lambda: CACHE_DIR)
     grouping: GroupingConfig = field(default_factory=GroupingConfig)
     alerts_json_path: Path | None = None

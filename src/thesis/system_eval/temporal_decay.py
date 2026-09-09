@@ -81,7 +81,9 @@ sweep):
      importances reflects the target window drifting, not the explainer's
      reference point moving. These are model-*output* attributions (which
      features move the score, and which way), not model-*performance*
-     attributions.
+     attributions. One-class models (iforest, ocsvm) get LIME only unless
+     config.oneclass_shap is set -- their SHAP has no analytic explainer and
+     the PermutationExplainer fallback dominates the run's cost.
 
 Every per_horizon_results.csv row also carries alert-group *novelty*
 columns (schema/model-independent, so one series covers every config at a
@@ -857,6 +859,17 @@ def _run_one_config(
         if config.compute_explanations
         else None
     )
+
+    # One-class SHAP has no analytic explainer -> PermutationExplainer over
+    # every feature at every horizon, the dominant cost of an explanations
+    # run. Unless explicitly asked for, flag the model so
+    # compute_shap_signed_importances raises straight away (LIME still runs).
+    if (
+        config.compute_explanations
+        and not config.oneclass_shap
+        and cfg.model in ONE_CLASS_MODELS
+    ):
+        fit.model._skip_shap = True
 
     base_row = {
         "scenario": scenario,

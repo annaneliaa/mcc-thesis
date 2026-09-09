@@ -187,6 +187,18 @@ def main() -> None:
         help="Skip SHAP/LIME importance tracking (metrics only, much faster).",
     )
     parser.add_argument(
+        "--oneclass-shap",
+        action="store_true",
+        dest="oneclass_shap",
+        help=(
+            "Also compute SHAP for the one-class models (iforest, ocsvm). Off "
+            "by default -- they have no analytic explainer, so SHAP falls back "
+            "to PermutationExplainer over every feature at every horizon, which "
+            "dominates an explanations run (hours vs minutes). Without this "
+            "flag the one-class models get LIME importances only."
+        ),
+    )
+    parser.add_argument(
         "--explain-background-n",
         type=int,
         default=100,
@@ -308,6 +320,7 @@ def main() -> None:
         threshold_mode=args.threshold_mode,
         calibrated_recall_target=args.calibrated_recall_target,
         compute_explanations=args.compute_explanations,
+        oneclass_shap=args.oneclass_shap,
         explain_background_n=args.explain_background_n,
         explain_sample_n=args.explain_sample_n,
         lime_num_samples=args.lime_num_samples,
