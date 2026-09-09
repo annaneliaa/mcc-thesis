@@ -108,9 +108,9 @@ def fit_window(
     raises) if the mining setting can't be resolved or the window turns out
     to be single-class -- both non-fatal, "this step can't run" conditions
     the caller is expected to skip past."""
-    if cfg.feature_set == "cscas_full":
+    if cfg.feature_set in ("cscas_full", "cscas_full_symbolic"):
         print(
-            "  [warn] feature_set='cscas_full' is only supported by the "
+            f"  [warn] feature_set={cfg.feature_set!r} is only supported by the "
             "temporal-decay experiment -- skipping this config"
         )
         return None

@@ -20,6 +20,10 @@ feature_set is one of:
     paper's full oracle features?" -- not a candidate schema. SCAS is
     dropped for one-class models (it is itself an anomaly score). Added by
     the runner's --cscas-full flag; carries no mining_setting.
+  * "cscas_full_symbolic" -- the union of "cscas_full" and "symbolic": the
+    full CSCAS columns plus a schema mined on W_src. The shared base
+    columns are encoded once, not doubled. Carries a mining_setting like
+    "symbolic"; added by the runner's --cscas-full-symbolic flag.
 
 Models: supervised classifiers (logreg, xgboost, ...) fit on the mixed W_src
 train split, every one made class-imbalance-aware (class_weight="balanced"
@@ -245,21 +249,33 @@ def _build_window_scheme(
     return WindowScheme("baseline_split", n_total, split_idx)
 
 
-def _cscas_full_schema(model_name: str) -> FeatureSchema:
-    """The CSCAS paper's full feature set (encoders.cscas_full) as a
-    base-only FeatureSchema. `scas` -- CSCAS's own precomputed
-    outlier/inlier score -- is dropped for one-class models, since feeding
-    an anomaly score into an anomaly detector is circular; it's kept for
-    supervised classifiers, matching the paper's own protocol."""
+# feature_set values whose schema is base + a mined symbolic layer (so they
+# resolve a mining_setting and go through the mining path); the base half is
+# the reduced columns for "symbolic" and the full CSCAS columns for
+# "cscas_full_symbolic".
+_SYMBOLIC_FEATURE_SETS = frozenset({"symbolic", "cscas_full_symbolic"})
+
+
+def _cscas_full_base(model_name: str) -> BaseFeatureSchema:
+    """The CSCAS paper's full column list (encoders.cscas_full) as a
+    BaseFeatureSchema. `scas` -- CSCAS's own precomputed outlier/inlier
+    score -- is dropped for one-class models, since feeding an anomaly score
+    into an anomaly detector is circular; it's kept for supervised
+    classifiers, matching the paper's own protocol."""
     feats = [
         f
         for f in CSCAS_FULL_FEATURES
         if not (f == "scas" and model_name in ONE_CLASS_MODELS)
     ]
+    return BaseFeatureSchema(feats, kind="cscas_full")
+
+
+def _cscas_full_schema(model_name: str) -> FeatureSchema:
+    """The CSCAS paper's full feature set as a base-only FeatureSchema."""
     return FeatureSchema(
         schema_name="cscas_full",
         schema_version="0.1.0",
-        base=BaseFeatureSchema(feats, kind="cscas_full"),
+        base=_cscas_full_base(model_name),
         symbolic=None,
     )
 
@@ -388,8 +404,9 @@ def fit_source_window(
     force_remine: bool = False,
     scheme: WindowScheme | None = None,
 ) -> SourceWindowFit | None:
-    """Mine (if `cfg.feature_set == "symbolic"`) on the source window's train
-    split, fit `cfg.model` on that same train split, and decide a frozen
+    """Mine (for `cfg.feature_set` in {"symbolic", "cscas_full_symbolic"}) on
+    the source window's train split, fit `cfg.model` on that same train
+    split, and decide a frozen
     threshold from its own scores. `scheme` picks what the source window is
     (default: window 0 at the config's granularity -- see WindowScheme).
     Returns None (with a warning printed, never raises) if the mining
@@ -401,7 +418,7 @@ def fit_source_window(
     n_windows = scheme.n_windows(gran)
 
     spec = None
-    if cfg.feature_set == "symbolic":
+    if cfg.feature_set in _SYMBOLIC_FEATURE_SETS:
         spec = mining_settings_by_name.get(cfg.mining_setting)
         if spec is None:
             print(
@@ -429,52 +446,53 @@ def fit_source_window(
         schema = base_schema
     elif cfg.feature_set == "cscas_full":
         schema = _cscas_full_schema(cfg.model)
-    elif scheme.mode == "baseline_split":
-        tf_tag = f"{train_frac_within_window:.6f}".rstrip("0").rstrip(".")
-        schema_result = get_or_mine_slice_attribute_schema(
-            scenario=scenario,
-            alert_groups=alert_groups,
-            alert_groups_path=alert_groups_path,
-            slice_start=win_start,
-            slice_end=win_train_end,
-            slice_tag=f"baseline_split_train{tf_tag}",
-            attribute_mining_config=spec.to_attribute_mining_config(),
-            force=force_remine,
-        )
-        symbolic = load_symbolic_feature_schema(schema_result.schema_path)
-        schema = FeatureSchema(
-            schema_name="base+symbolic",
-            schema_version=symbolic.schema_version,
-            base=base_schema.base,
-            symbolic=symbolic,
-        )
-        cache_hit = schema_result.cache_hit
-        print(
-            f"    [{cfg.mining_setting}] {'cache hit' if cache_hit else 'mined fresh'} "
-            f"({len(symbolic.features)} features)"
-        )
     else:
-        schema_result = get_or_mine_window_attribute_schema(
-            scenario=scenario,
-            alert_groups=alert_groups,
-            alert_groups_path=alert_groups_path,
-            gran=gran,
-            win_idx=0,
-            attribute_mining_config=spec.to_attribute_mining_config(),
-            train_frac=train_frac_within_window,
-            force=force_remine,
-        )
+        # "symbolic" or "cscas_full_symbolic": mine the symbolic layer on
+        # W_src's train split, then attach it to the reduced base columns
+        # ("symbolic") or the full CSCAS columns ("cscas_full_symbolic").
+        # encode_alert_groups_for_schema drops any column the two halves
+        # share, so the base features aren't doubled.
+        if scheme.mode == "baseline_split":
+            tf_tag = f"{train_frac_within_window:.6f}".rstrip("0").rstrip(".")
+            schema_result = get_or_mine_slice_attribute_schema(
+                scenario=scenario,
+                alert_groups=alert_groups,
+                alert_groups_path=alert_groups_path,
+                slice_start=win_start,
+                slice_end=win_train_end,
+                slice_tag=f"baseline_split_train{tf_tag}",
+                attribute_mining_config=spec.to_attribute_mining_config(),
+                force=force_remine,
+            )
+        else:
+            schema_result = get_or_mine_window_attribute_schema(
+                scenario=scenario,
+                alert_groups=alert_groups,
+                alert_groups_path=alert_groups_path,
+                gran=gran,
+                win_idx=0,
+                attribute_mining_config=spec.to_attribute_mining_config(),
+                train_frac=train_frac_within_window,
+                force=force_remine,
+            )
         symbolic = load_symbolic_feature_schema(schema_result.schema_path)
+        cache_hit = schema_result.cache_hit
+        if cfg.feature_set == "cscas_full_symbolic":
+            base_part = _cscas_full_base(cfg.model)
+            schema_tag = "cscas_full+symbolic"
+        else:
+            base_part = base_schema.base
+            schema_tag = "base+symbolic"
         schema = FeatureSchema(
-            schema_name="base+symbolic",
+            schema_name=schema_tag,
             schema_version=symbolic.schema_version,
-            base=base_schema.base,
+            base=base_part,
             symbolic=symbolic,
         )
-        cache_hit = schema_result.cache_hit
         print(
-            f"    [{cfg.mining_setting}] {'cache hit' if cache_hit else 'mined fresh'} "
-            f"({len(symbolic.features)} features)"
+            f"    [{cfg.mining_setting}] {schema_tag}: "
+            f"{'cache hit' if cache_hit else 'mined fresh'} "
+            f"({len(base_part.features)} base + {len(symbolic.features)} symbolic)"
         )
 
     encoded_src = encode_alert_groups_for_schema(window_rows, schema)

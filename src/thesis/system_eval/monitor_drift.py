@@ -135,9 +135,9 @@ def fit_source_window_and_dynamic_schema(
     decide a frozen threshold from its own scores. Returns None (warns,
     never raises) for the same non-fatal "this config can't run" conditions
     fit_source_window does."""
-    if cfg.feature_set == "cscas_full":
+    if cfg.feature_set in ("cscas_full", "cscas_full_symbolic"):
         print(
-            "  [warn] feature_set='cscas_full' is only supported by the "
+            f"  [warn] feature_set={cfg.feature_set!r} is only supported by the "
             "temporal-decay experiment -- skipping this config"
         )
         return None

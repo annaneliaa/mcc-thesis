@@ -39,6 +39,7 @@ def build_shortlist_from_mining_grid(
     models: list[str],
     include_baseline: bool,
     include_cscas_full: bool = False,
+    include_cscas_full_symbolic: bool = False,
 ) -> pd.DataFrame:
     """Cross every named entry in the mining-settings YAML
     (configs/screening_mining_settings.yaml -- the curated downstream
@@ -90,4 +91,16 @@ def build_shortlist_from_mining_grid(
                         "model": model,
                     }
                 )
+    if include_cscas_full_symbolic:
+        for name in names:
+            for gran in granularities:
+                for model in models:
+                    rows.append(
+                        {
+                            "feature_set": "cscas_full_symbolic",
+                            "mining_setting": name,
+                            "granularity": gran,
+                            "model": model,
+                        }
+                    )
     return pd.DataFrame(rows)

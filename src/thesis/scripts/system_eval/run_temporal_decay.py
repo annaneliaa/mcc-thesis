@@ -132,6 +132,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--cscas-full-symbolic",
+        action="store_true",
+        dest="include_cscas_full_symbolic",
+        help=(
+            "Add a cscas_full_symbolic row per (mining setting, granularity, "
+            "model): the full CSCAS columns PLUS a schema mined on W_src "
+            "(shared base columns encoded once, not doubled). CSCAS only."
+        ),
+    )
+    parser.add_argument(
         "--train-frac",
         type=float,
         default=0.7,
@@ -268,6 +278,7 @@ def main() -> None:
             args.models,
             args.include_baseline,
             args.include_cscas_full,
+            args.include_cscas_full_symbolic,
         )
         derived_dir = (
             _REPO / "artifacts" / "experiments" / "temporal_decay" / args.scenario

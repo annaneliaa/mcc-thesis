@@ -79,6 +79,10 @@ SOURCE_SPLIT_MODE="baseline_split"  # or "window0"
 # the paper's full oracle features?". SCAS is dropped for the one-class
 # models (it is itself an anomaly score). CSCAS only.
 CSCAS_FULL=1  # 0 to skip the cscas_full arm
+# CSCAS_FULL_SYMBOLIC=1 adds a cscas_full_symbolic arm: the full CSCAS columns
+# PLUS a schema mined on W_src (shared base columns encoded once). One row per
+# (mining setting, granularity, model) -- as many configs as the symbolic arm.
+CSCAS_FULL_SYMBOLIC=1  # 0 to skip
 # SHAP/LIME per horizon. logreg (LinearExplainer) and xgboost (TreeExplainer)
 # get analytic SHAP + LIME. iforest/ocsvm have no analytic SHAP explainer, so
 # by default (ONECLASS_SHAP=0) they get LIME only -- the PermutationExplainer
@@ -145,6 +149,9 @@ for scenario in "${SCENARIOS[@]}"; do
   fi
   if [[ "${CSCAS_FULL:-0}" -eq 1 ]]; then
     cmd+=(--cscas-full)
+  fi
+  if [[ "${CSCAS_FULL_SYMBOLIC:-0}" -eq 1 ]]; then
+    cmd+=(--cscas-full-symbolic)
   fi
 
   "${cmd[@]}" >"$log_file" 2>&1

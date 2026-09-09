@@ -212,6 +212,35 @@ def test_load_shortlist_cscas_full_with_mining_setting_raises(tmp_path):
         load_shortlist(path)
 
 
+def test_load_shortlist_cscas_full_symbolic_requires_mining_setting(tmp_path):
+    ok = _write_csv(
+        tmp_path,
+        [
+            {
+                "feature_set": "cscas_full_symbolic",
+                "mining_setting": "gr3.0_md3",
+                "granularity": 0.1,
+                "model": "xgboost",
+            }
+        ],
+    )
+    assert load_shortlist(ok)[0].feature_set == "cscas_full_symbolic"
+
+    bad = tmp_path / "bad.csv"
+    pd.DataFrame(
+        [
+            {
+                "feature_set": "cscas_full_symbolic",
+                "mining_setting": "",
+                "granularity": 0.1,
+                "model": "xgboost",
+            }
+        ]
+    ).to_csv(bad, index=False)
+    with pytest.raises(ValueError, match="requires a"):
+        load_shortlist(bad)
+
+
 def test_load_shortlist_baseline_with_mining_setting_raises(tmp_path):
     path = _write_csv(
         tmp_path,
@@ -332,6 +361,44 @@ def test_fixed_threshold_for_supervised_model_stays_at_half():
     )
 
 
+# ---- shortlist builder ----------------------------------------------------
+
+
+def test_build_shortlist_grid_optional_arms():
+    from pathlib import Path
+
+    from thesis.scripts.system_eval._common import build_shortlist_from_mining_grid
+
+    yaml = Path("src/thesis/configs/screening_mining_settings.yaml")
+    if not yaml.exists():
+        pytest.skip("mining-settings grid not present")
+
+    base = build_shortlist_from_mining_grid(
+        yaml, [0.1], ["logreg", "iforest"], include_baseline=True
+    )
+    assert set(base.feature_set) == {"symbolic", "baseline"}
+
+    full = build_shortlist_from_mining_grid(
+        yaml,
+        [0.1],
+        ["logreg", "iforest"],
+        include_baseline=True,
+        include_cscas_full=True,
+        include_cscas_full_symbolic=True,
+    )
+    assert set(full.feature_set) == {
+        "symbolic",
+        "baseline",
+        "cscas_full",
+        "cscas_full_symbolic",
+    }
+    # cscas_full_symbolic is crossed with every mining setting, like symbolic
+    n_ms = full[full.feature_set == "symbolic"].mining_setting.nunique()
+    assert (full.feature_set == "cscas_full_symbolic").sum() == n_ms * 1 * 2
+    assert full[full.feature_set == "cscas_full_symbolic"].mining_setting.notna().all()
+    assert full[full.feature_set == "cscas_full"].mining_setting.isna().all()
+
+
 # ---- _cscas_full_schema ----------------------------------------------------
 
 
@@ -345,6 +412,17 @@ def test_cscas_full_schema_keeps_scas_for_classifiers_drops_it_for_one_class():
         sch = _cscas_full_schema(one_class)
         assert "scas" not in sch.base.features
         assert len(sch.base.features) == len(clf.base.features) - 1
+
+
+def test_cscas_full_base_reused_for_the_symbolic_union():
+    from thesis.system_eval.temporal_decay import _cscas_full_base
+
+    b = _cscas_full_base("xgboost")
+    assert b.kind == "cscas_full"
+    assert "scas" in b.features
+    assert _cscas_full_schema("xgboost").base.features == b.features
+    # one-class variant drops scas here too
+    assert "scas" not in _cscas_full_base("ocsvm").features
 
 
 # ---- per-horizon novelty --------------------------------------------------
